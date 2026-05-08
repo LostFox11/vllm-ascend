@@ -78,7 +78,7 @@ from vllm.v1.outputs import (
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata#, MultiLayerEagleMetadata
+from vllm.v1.spec_decode.metadata import MultiLayerEagleMetadata, SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -119,7 +119,7 @@ from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
-from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer#, AscendMultiLayerEagleProposer
+from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer, AscendMultiLayerEagleProposer
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
@@ -219,7 +219,7 @@ class ExecuteModelState(NamedTuple):
     scheduler_output: "SchedulerOutput"
     logits: torch.Tensor
     spec_decode_metadata: SpecDecodeMetadata | None
-    # multi_layer_eagle_metadata: MultiLayerEagleMetadata | None
+    multi_layer_eagle_metadata: MultiLayerEagleMetadata | None
     spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None
     hidden_states: torch.Tensor
     sample_hidden_states: torch.Tensor
@@ -499,7 +499,7 @@ class NPUModelRunner(GPUModelRunner):
         self.drafter: (
             AscendNgramProposer
             | AscendEagleProposer
-            #| AscendMultiLayerEagleProposer
+            | AscendMultiLayerEagleProposer
             | AscendDraftModelProposer
             | AscendDflashProposer
             | AscendSuffixDecodingProposer
@@ -629,12 +629,13 @@ class NPUModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
         num_scheduled_tokens: np.ndarray,
-    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int]: #, MultiLayerEagleMetadata | None]:
+    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int, MultiLayerEagleMetadata | None]:
         """
         :return: tuple[
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
+            multi_layer_eagle_metadata,
         ]
         """
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -1063,15 +1064,14 @@ class NPUModelRunner(GPUModelRunner):
         self.logits_indices = logits_indices
 
         multi_layer_eagle_metadata = None
-        # if self.enable_multi_layer_eagle:
-        #     multi_layer_eagle_metadata = MultiLayerEagleMetadata(
-        #         cached_len=self.input_batch.cached_len[:num_reqs],
-        #         cached_token_ids=self.input_batch.cached_token_ids[:num_reqs],
-        #         cached_hidden_states=self.input_batch.cached_hidden_states[:num_reqs],
-        #         cached_slot_mappings=self.input_batch.cached_slot_mappings[:num_reqs],
-        #         cached_positions=self.input_batch.cached_positions[:num_reqs],
-        #     )
-            
+        if self.enable_multi_layer_eagle:
+            multi_layer_eagle_metadata = MultiLayerEagleMetadata(
+                cached_len=self.input_batch.cached_len[:num_reqs],
+                cached_token_ids=self.input_batch.cached_token_ids[:num_reqs],
+                cached_hidden_states=self.input_batch.cached_hidden_states[:num_reqs],
+                cached_slot_mappings=self.input_batch.cached_slot_mappings[:num_reqs],
+                cached_positions=self.input_batch.cached_positions[:num_reqs],
+            )
 
         # Hot-Swap lora model
         if self.lora_config:
@@ -1098,7 +1098,7 @@ class NPUModelRunner(GPUModelRunner):
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
-            # multi_layer_eagle_metadata,
+            multi_layer_eagle_metadata,
         )
 
     def _preprocess(
@@ -1338,7 +1338,7 @@ class NPUModelRunner(GPUModelRunner):
         sampling_metadata: SamplingMetadata,
         scheduler_output: "SchedulerOutput",
         spec_decode_metadata: SpecDecodeMetadata,
-        # multi_layer_eagle_metadata: MultiLayerEagleMetadata,
+        multi_layer_eagle_metadata: MultiLayerEagleMetadata | None,
         spec_decode_common_attn_metadata: AscendCommonAttentionMetadata,
         positions: torch.Tensor,
         num_scheduled_tokens: int,
@@ -1503,7 +1503,7 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output=scheduler_output,
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                # multi_layer_eagle_metadata=multi_layer_eagle_metadata,
+                multi_layer_eagle_metadata=multi_layer_eagle_metadata,
             )
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
@@ -1600,7 +1600,7 @@ class NPUModelRunner(GPUModelRunner):
                     logits_indices,
                     spec_decode_metadata,
                     total_num_scheduled_tokens,
-                    # multi_layer_eagle_metadata,
+                    multi_layer_eagle_metadata,
                 ) = self._prepare_inputs(
                     scheduler_output,
                     num_scheduled_tokens_np,
@@ -1857,7 +1857,7 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output,
                 logits,
                 spec_decode_metadata,
-                # multi_layer_eagle_metadata,
+                multi_layer_eagle_metadata,
                 spec_decode_common_attn_metadata,
                 hidden_states,
                 sample_hidden_states,
@@ -1906,7 +1906,7 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output,
             logits,
             spec_decode_metadata,
-            # multi_layer_eagle_metadata,
+            multi_layer_eagle_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
             sample_hidden_states,
@@ -1948,7 +1948,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch.sampling_metadata,
                 scheduler_output,
                 spec_decode_metadata,
-                # multi_layer_eagle_metadata,
+                multi_layer_eagle_metadata,
                 spec_decode_common_attn_metadata,
                 positions,
                 scheduler_output.total_num_scheduled_tokens,
@@ -2655,7 +2655,13 @@ class NPUModelRunner(GPUModelRunner):
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(kv_cache_gid)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer ):#| AscendMultiLayerEagleProposer):
+                if isinstance(
+                    self.drafter,
+                    AscendEagleProposer
+                    | AscendMultiLayerEagleProposer
+                    | AscendDraftModelProposer
+                    | AscendDflashProposer,
+                ):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
                 else:
@@ -3094,7 +3100,13 @@ class NPUModelRunner(GPUModelRunner):
         if self.speculative_config and (
             self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
         ):
-            assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer )#| AscendMultiLayerEagleProposer)
+            assert isinstance(
+                self.drafter,
+                AscendEagleProposer
+                | AscendMultiLayerEagleProposer
+                | AscendDflashProposer
+                | AscendDraftModelProposer,
+            )
             block_size = (self.kernel_block_sizes[0] if isinstance(
             self.kernel_block_sizes, list) else self.kernel_block_sizes)
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)

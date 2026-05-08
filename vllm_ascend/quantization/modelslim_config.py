@@ -471,9 +471,8 @@ class AscendModelSlimConfig(QuantizationConfig):
         return None
 
     def quant_prefix_mapper(self, model_type: str, prefix: str) -> str:
-        # if model_type == "step3p5":
-        #     prefix = prefix.replace(".moe.share_expert", ".share_expert")
-        #     prefix = prefix.replace(".mtp_block.", ".")
+        if model_type == "step3p5":
+            prefix = prefix.replace(".mtp_block.", ".")
         self.model_type = model_type
         return prefix
 
