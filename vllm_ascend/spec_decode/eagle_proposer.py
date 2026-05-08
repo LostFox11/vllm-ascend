@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import math
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
@@ -26,13 +27,13 @@ from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
-from vllm.triton_utils import HAS_TRITON, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.spec_decode.eagle import EagleProposer, SpecDecodeBaseProposer
+from vllm.v1.spec_decode.eagle import EagleProposer, SpecDecodeBaseProposer#, MultiLayerEagleMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
@@ -49,6 +50,9 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
+
+BLOCK_HIDDEN = 64
+BLOCK_TOKENS = 64
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
@@ -1808,3 +1812,1193 @@ class AscendEagleProposer(EagleProposer, AscendSpecDecodeBaseProposer):
         runner=None,
     ):
         AscendSpecDecodeBaseProposer.__init__(self, vllm_config, device, True, runner=runner)
+
+
+# class MultiLayerEagleProposer(SpecDecodeBaseProposer):
+#     _runnable: ACLGraphWrapper | Callable
+
+#     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
+#         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
+        
+#         self.layer_num: int = getattr(
+#             self.speculative_config.draft_model_config.hf_text_config, "n_predict", 0
+#         )
+#         self.num_speculative_tokens: int = (
+#             self.speculative_config.num_speculative_tokens
+#         )
+    
+#     def adjust_input(
+#         self,
+#         batch_size: int,
+#         target_token_ids: torch.Tensor,
+#         target_positions: torch.Tensor,
+#         target_hidden_states: torch.Tensor,
+#         token_indices_to_sample: torch.Tensor,
+#         common_attn_metadata: CommonAttentionMetadata,
+#         multi_layer_eagle_metadata: MultiLayerEagleMetadata | None = None,
+#     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
+
+#         assert multi_layer_eagle_metadata is not None
+#         if token_indices_to_sample is None:
+#             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
+#             # token_indices_to_sample_cpu = common_attn_metadata.query_start_loc_cpu[1:] - 1
+
+#         MAX_SHIFT = self.layer_num
+#         assert MAX_SHIFT > 0
+
+#         prev_token_ids = target_token_ids.clone()
+#         prev_positions = target_positions.clone()
+#         prev_hidden_states = target_hidden_states.clone()
+#         slot_mapping = common_attn_metadata.slot_mapping
+
+#         start_token_indices = common_attn_metadata.query_start_loc[:-1]
+#         end_token_indices = common_attn_metadata.query_start_loc[1:] - 1
+
+#         pos_for_shift = (
+#             target_positions[0] if target_positions.dim() == 2 else target_positions
+#         )
+#         start_token_pos = pos_for_shift[start_token_indices]
+
+#         shift = torch.minimum(
+#             end_token_indices - token_indices_to_sample,
+#             start_token_pos,
+#         )
+#         shift = torch.clamp(shift, min=0)
+
+#         # Metadata updates (matches the original reference implementation).
+#         token_indices_to_sample.add_(shift)
+#         common_attn_metadata.seq_lens.sub_(shift)
+
+#         # NOTE: ignore cpu data to avoid device sync
+#         common_attn_metadata.seq_lens_cpu.copy_(common_attn_metadata.seq_lens,
+#                                                 non_blocking=True)
+#         # query_lens = common_attn_metadata.query_start_loc[
+#         #     1:] - common_attn_metadata.query_start_loc[:-1]
+#         # num_computed_tokens = common_attn_metadata.seq_lens - query_lens.to(
+#         #     common_attn_metadata.seq_lens.dtype)
+#         # common_attn_metadata.num_computed_tokens_cpu.copy_(
+#         #     num_computed_tokens.to(
+#         #         common_attn_metadata.num_computed_tokens_cpu.dtype),
+#         #     non_blocking=True,
+#         # )
+#         # common_attn_metadata.max_seq_len = int(common_attn_metadata.seq_lens_cpu.max().item())
+
+#         cached_lens = multi_layer_eagle_metadata.cached_len
+#         shift = torch.minimum(shift, cached_lens)
+
+#         _multi_layer_eagle_shift_and_cache(
+#             batch_size=batch_size,
+#             max_shift=MAX_SHIFT,
+#             src_token_ids=target_token_ids,
+#             dst_token_ids=prev_token_ids,
+#             src_positions=target_positions,
+#             dst_positions=prev_positions,
+#             src_hidden_states=target_hidden_states,
+#             dst_hidden_states=prev_hidden_states,
+#             src_slot_mapping=slot_mapping,
+#             dst_slot_mapping=slot_mapping,
+#             start_token_indices=start_token_indices,
+#             end_token_indices=end_token_indices,
+#             token_indices_to_sample=token_indices_to_sample,
+#             shift=shift,
+#             cached_lens=cached_lens,
+#             cached_prev_token_ids=multi_layer_eagle_metadata.cached_token_ids,
+#             cached_prev_positions=multi_layer_eagle_metadata.cached_positions,
+#             cached_prev_hidden_states=multi_layer_eagle_metadata.cached_hidden_states,
+#             cached_slot_mappings=multi_layer_eagle_metadata.cached_slot_mappings,
+#             common_attn_metadata=common_attn_metadata,
+#         )
+
+#         return prev_token_ids, prev_positions, prev_hidden_states, common_attn_metadata
+
+#     @torch.inference_mode()
+#     def dummy_run(
+#         self,
+#         num_tokens: int,
+#         with_prefill: bool = False,
+#         in_graph_capturing: bool = False,
+#         num_reqs: int = 0,
+#         num_tokens_across_dp: torch.Tensor | None = None,
+#         aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+#         batch_descriptor=None,
+#         dummy_compute_logits=lambda hidden_states: None,
+#         is_profile=False,
+#         slot_mappings: dict[str, torch.Tensor] | None = None,
+#     ):
+#         (
+#             num_tokens,
+#             num_tokens_across_dp,
+#             _,
+#         ) = self.runner._sync_metadata_across_dp(num_tokens, is_draft_model=True)
+
+#         multi_steps_attn_metadata = []
+#         multi_layer_eagle_metadata = None
+        
+#         # 添加多层Eagle元数据构建
+#         multi_layer_eagle_metadata = MultiLayerEagleMetadata.make_dummy(
+#             layer_num=self.layer_num,
+#             hidden_size=self.hidden_size,
+#             device=self.device,
+#         )
+        
+#         if not self.use_cuda_graph:
+#             aclgraph_runtime_mode = CUDAGraphMode.NONE
+
+#         # init block table tensor clone is only available after profile run and is only used for graph mode
+#         if (
+#             self.pcp_size * self.dcp_size > 1
+#             and self.use_cuda_graph
+#             and not is_profile
+#             and self.block_table_tensor_clone is None
+#         ):
+#             self.block_table_tensor_clone = torch.zeros(
+#                 (
+#                     self.runner.max_num_tokens + 2 * self.pcp_size * self.runner.max_num_reqs,
+#                     self.runner.input_batch.block_table[0].get_device_tensor().shape[1],
+#                 ),
+#                 dtype=torch.int32,
+#                 device=self.device,
+#                 pin_memory=self.runner.pin_memory,
+#             )
+
+#         if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
+#             num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+
+#             # num_reqs is already the padded version
+#             self.query_start_loc.cpu[: num_reqs + 1].copy_(self.runner.query_start_loc.cpu[: num_reqs + 1])
+#             self.query_start_loc.copy_to_gpu()
+
+#             common_attn_metadata = AscendCommonAttentionMetadata(
+#                 query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
+#                 query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs + 1],
+#                 seq_lens_cpu=self.runner.optimistic_seq_lens_cpu,
+#                 seq_lens=self.runner.seq_lens[:num_reqs],
+#                 num_reqs=num_reqs,
+#                 num_actual_tokens=num_tokens,
+#                 num_input_tokens=num_tokens,
+#                 max_query_len=self.num_speculative_tokens + 1,
+#                 num_computed_tokens_cpu=num_computed_tokens_cpu,
+#                 actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
+#                 block_table_tensor=self.runner.input_batch.block_table[0].get_device_tensor()[:num_reqs],
+#                 # This is used to hold a position.
+#                 slot_mapping=self.runner.input_batch.block_table[0].slot_mapping.gpu,
+#                 positions=self.runner.positions,
+#                 attn_state=self.runner.attn_state,
+#                 decode_token_per_req=self.runner.decode_token_per_req,
+#                 max_seq_len=0,
+#             )
+#             if self.pcp_size * self.dcp_size > 1:
+#                 # update long_seq related params and flatten block_table
+#                 common_attn_metadata.prefill_context_parallel_metadata = self.runner.pcp_manager.long_seq_metadata
+#                 common_attn_metadata.block_table_tensor = self.runner.input_batch.block_table[0].get_device_tensor()[
+#                     : num_reqs * self.decode_threshold
+#                 ]
+
+#             assert len(self.draft_attn_groups) > 0
+#             builder = self.draft_attn_groups[0].get_metadata_builder()
+#             # update the tensor's address for each step.
+#             for draft_step in range(self.num_speculative_tokens):
+#                 common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+#                 # Set the real slot_mapping.
+#                 common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
+#                 common_attn_metadata.seq_lens = self.seq_lens_group[draft_step][:num_reqs]
+#                 common_attn_metadata.query_start_loc = self.query_start_loc_group[draft_step][: num_reqs + 1]
+#                 if self.pcp_size * self.dcp_size > 1 and draft_step > 0:
+#                     assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
+#                     slicing_length = num_reqs * self.decode_threshold
+#                     common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:slicing_length]
+#                 attn_metadata_eagle = builder.build_for_graph_capture(
+#                     common_attn_metadata,
+#                     AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill,
+#                 )
+#                 per_layer_attn_metadata = dict()
+#                 for layer_name in self.attn_layer_names:
+#                     per_layer_attn_metadata[layer_name] = attn_metadata_eagle
+#                 multi_steps_attn_metadata.append(per_layer_attn_metadata)
+
+#         model_positions = self._get_positions(num_tokens)
+
+#         batch_size = max(num_tokens // (self.num_speculative_tokens + 1), 1)
+#         # TODO: temporarily hack here, we should find out batch_size for profile_run
+#         if is_profile:
+#             batch_size = min(batch_size, self.runner.max_num_reqs)
+
+#         if self.supports_mm_inputs:
+#             mm_embeds, is_mm_embed = (None, None)
+#             inputs_embeds = self.model.embed_input_ids(
+#                 self.input_ids[:num_tokens], multimodal_embeddings=mm_embeds, is_multimodal=is_mm_embed
+#             )
+#             self.inputs_embeds[:num_tokens] = inputs_embeds
+#             inputs_embeds = self.inputs_embeds[:num_tokens]
+#         else:
+#             inputs_embeds = None
+            
+#         adjust_input_kwargs = {
+#             "batch_size": batch_size,
+#             "target_token_ids": self.input_ids[:num_tokens],
+#             "target_positions": self._get_positions(num_tokens),
+#             "target_hidden_states": self.hidden_states[:num_tokens],
+#             "token_indices_to_sample": torch.tensor(
+#                 [num_tokens - 1], dtype=torch.int32, device=self.device
+#             ),
+#             "common_attn_metadata": AscendCommonAttentionMetadata(
+#                 query_start_loc=torch.tensor(
+#                     [0, num_tokens], dtype=torch.int32, device=self.device
+#                 ),
+#                 query_start_loc_cpu=torch.tensor(
+#                     [0, num_tokens], dtype=torch.int32, device="cpu"
+#                 ),
+#                 seq_lens=torch.tensor(
+#                     [num_tokens], dtype=torch.int32, device=self.device
+#                 ),
+#                 seq_lens_cpu=torch.tensor(
+#                     [num_tokens], dtype=torch.int32, device="cpu"
+#                 ),
+#                 num_reqs=1,
+#                 num_actual_tokens=num_tokens,
+#                 max_query_len=num_tokens,
+#                 max_seq_len=self.max_model_len,
+#                 block_table_tensor=torch.tensor(
+#                     [], dtype=torch.int32, device=self.device
+#                 ),
+#                 slot_mapping=self.arange[:num_input_tokens],
+#                 logits_indices_padded=None,
+#                 num_logits_indices=None,
+#                 causal=True,
+#                 encoder_seq_lens=None,
+#             ),
+#             "multi_layer_eagle_metadata": MultiLayerEagleMetadata.make_dummy(
+#                 layer_num=self.layer_num,
+#                 hidden_size=self.hidden_size,
+#                 device=self.device,
+#             ),
+#         }
+#         self.adjust_input(**adjust_input_kwargs)
+
+#         with set_ascend_forward_context(
+#             multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,
+#             self.vllm_config,
+#             num_tokens=num_tokens,
+#             num_tokens_across_dp=num_tokens_across_dp,
+#             num_actual_tokens=0,
+#             in_profile_run=is_profile,
+#             batch_descriptor=batch_descriptor,
+#             aclgraph_runtime_mode=aclgraph_runtime_mode,
+#             is_draft_model=True,
+#             draft_attn_metadatas=multi_steps_attn_metadata,
+#         ):
+#             # Reset MOE layer index before first model call
+#             forward_context = get_forward_context()
+#             if forward_context is not None:
+#                 forward_context.moe_layer_index = 0
+
+#             self._runnable(
+#                 num_input_tokens=num_tokens,
+#                 batch_size=batch_size,
+#                 token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
+#                 # The target_position's address is same as the model_positions's
+#                 target_positions=model_positions,
+#                 inputs_embeds=inputs_embeds,
+#                 common_attn_metadata=None,
+#                 multi_steps_attn_metadata=multi_steps_attn_metadata,
+#                 num_tokens=num_tokens,
+#             )
+#             forward_context = get_forward_context()
+#             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
+#                 self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
+
+#     def _update_full_graph_params_if_needed(
+#         self,
+#         forward_context: ForwardContext,
+#         num_input_tokens: int,
+#         multi_steps_attn_metadata: list[dict[str, Any]],
+#     ) -> None:
+#         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
+#             self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
+
+#     def _propose(
+#         self,
+#         # [num_tokens]
+#         target_token_ids: torch.Tensor,
+#         # [num_tokens] or [3, num_tokens] when M-RoPE is enabled
+#         target_positions: torch.Tensor,
+#         # [num_tokens, hidden_size]
+#         target_hidden_states: torch.Tensor,
+#         # [batch_size]
+#         next_token_ids: torch.Tensor,
+#         token_indices_to_sample: torch.Tensor | None,
+#         common_attn_metadata: CommonAttentionMetadata,
+#         target_model_batch_desc: BatchDescriptor,
+#         sampling_metadata: SamplingMetadata,
+#         multi_layer_eagle_metadata: MultiLayerEagleMetadata | None = None,
+#         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+#         req_scheduled_tokens=None,
+#         long_seq_metadata=None,
+#         num_prefill_reqs=0,
+#         num_decode_reqs=0,
+#         scheduler_output: SchedulerOutput = None,
+#         num_scheduled_tokens: int = 0,
+#         num_rejected_tokens_gpu: torch.Tensor | None = None,
+#     ) -> torch.Tensor:
+#         batch_size = common_attn_metadata.batch_size()
+
+#         if token_indices_to_sample is None:
+#             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
+
+#         if self.method in ("eagle3", "dflash"):
+#             assert isinstance(self.get_model(), (Eagle3LlamaForCausalLM, DFlashQwen3ForCausalLM))
+#             target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
+#             assert target_hidden_states.shape[-1] == self.hidden_size
+            
+#         (
+#             target_token_ids,
+#             target_positions,
+#             target_hidden_states,
+#             common_attn_metadata,
+#         ) = self.adjust_input(
+#             batch_size=batch_size,
+#             target_token_ids=target_token_ids,
+#             target_positions=target_positions,
+#             target_hidden_states=target_hidden_states,
+#             token_indices_to_sample=token_indices_to_sample,
+#             common_attn_metadata=common_attn_metadata,
+#             multi_layer_eagle_metadata=multi_layer_eagle_metadata,
+#         )
+
+#         num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(
+#             target_token_ids=target_token_ids,
+#             next_token_ids=next_token_ids,
+#             target_positions=target_positions,
+#             target_hidden_states=target_hidden_states,
+#             token_indices_to_sample=token_indices_to_sample,
+#             cad=common_attn_metadata,
+#             num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+#             req_scheduled_tokens=req_scheduled_tokens,
+#             long_seq_metadata=long_seq_metadata,
+#             num_prefill_reqs=num_prefill_reqs,
+#             num_decode_reqs=num_decode_reqs,
+#         )
+#         if self.pcp_size * self.dcp_size > 1:
+#             assert long_seq_args is not None
+#             query_lens_d, ori_token_indices_to_sample = long_seq_args
+#         assert self.runner is not None
+
+#         has_lora = len(self.runner.input_batch.lora_id_to_lora_request) > 0
+#         uniform_decode = target_model_batch_desc.uniform
+
+#         if self.use_cuda_graph:
+#             _, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
+#                 num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+#             )
+#             num_input_tokens = batch_descriptor.num_tokens
+#         else:
+#             num_input_tokens = num_tokens
+
+#         (
+#             num_input_tokens,
+#             num_tokens_across_dp,
+#             _,
+#         ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
+
+#         if self.use_cuda_graph:
+#             aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
+#                 num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+#             )
+#             num_input_tokens = batch_descriptor.num_tokens
+#         else:
+#             aclgraph_runtime_mode = CUDAGraphMode.NONE
+#             batch_descriptor = None
+
+#         if aclgraph_runtime_mode == CUDAGraphMode.FULL:
+#             # TODO: Due to the inconsistency between the proposer `dispatcher` and model runner, this padding
+#             # should have been done in model runner but not. For example, at prefill stage, target model
+#             # is run in eager mode currently, which means `_pad_query_start_loc_for_fia` is not called,
+#             # while draft model is run in graph model, which means we should pad the `query_start_loc`.
+#             # Need to be fixed in the future.
+#             num_reqs_padded = self.runner._pad_query_start_loc_for_fia(
+#                 num_input_tokens,
+#                 batch_descriptor.num_reqs if batch_descriptor.num_reqs is not None else common_attn_metadata.num_reqs,
+#                 common_attn_metadata.num_reqs,
+#                 aclgraph_runtime_mode,
+#                 batch_descriptor.num_reqs,
+#             )
+#             common_attn_metadata.num_reqs = num_reqs_padded
+#             common_attn_metadata.query_start_loc = self.runner.query_start_loc.gpu[: num_reqs_padded + 1]
+#             common_attn_metadata.query_start_loc_cpu = self.runner.query_start_loc.cpu[: num_reqs_padded + 1]
+#             slicing_length = (
+#                 num_reqs_padded * self.decode_threshold if self.pcp_size * self.dcp_size > 1 else num_reqs_padded
+#             )
+#             common_attn_metadata.block_table_tensor = self._adjust_tensor(
+#                 common_attn_metadata.block_table_tensor, slicing_length
+#             )
+#             if self.method == "dflash":
+#                 common_attn_metadata.seq_lens = self._adjust_tensor(common_attn_metadata.seq_lens, num_reqs_padded)
+#             else:
+#                 common_attn_metadata.seq_lens = self._adjust_tensor(self.runner.seq_lens, num_reqs_padded)
+#                 common_attn_metadata.seq_lens_cpu = self._adjust_tensor(
+#                     self.runner.optimistic_seq_lens_cpu, num_reqs_padded
+#                 )
+#             if common_attn_metadata.num_computed_tokens_cpu is not None:
+#                 common_attn_metadata.num_computed_tokens_cpu = self._adjust_tensor(
+#                     common_attn_metadata.num_computed_tokens_cpu, num_reqs_padded
+#                 )
+
+#             if self.pcp_size > 1:
+#                 pcp_allgather_restore_idx = (
+#                     common_attn_metadata.prefill_context_parallel_metadata.pcp_allgather_restore_idx
+#                 )
+#                 index = torch.arange(pcp_allgather_restore_idx.shape[0], device=pcp_allgather_restore_idx.device)
+#                 mask = (index % (self.pcp_size * self.decode_threshold)) >= self.decode_threshold
+#                 pcp_allgather_restore_idx[mask] = 0
+#                 self.runner.pcp_manager.pcp_allgather_restore_idx.gpu[: pcp_allgather_restore_idx.shape[0]] = (
+#                     pcp_allgather_restore_idx
+#                 )
+#                 self.runner.pcp_manager.pcp_allgather_restore_idx.gpu[pcp_allgather_restore_idx.shape[0] :] = 0
+#         else:
+#             num_reqs_padded = common_attn_metadata.num_reqs
+#             # In the below scenario, padding has been applied by _pad_query_start_loc_for_fia in the model runner.
+#             # We need to unpad here for eager mode to maintain compatibility.
+#             if (enable_sp() and not self.vllm_config.model_config.use_mla) and self.pcp_size * self.dcp_size == 1:
+#                 common_attn_metadata.block_table_tensor = self._adjust_tensor(
+#                     common_attn_metadata.block_table_tensor, num_reqs_padded
+#                 )
+
+#         if self.supports_mm_inputs:
+#             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
+#             inputs_embeds = self.model.embed_input_ids(
+#                 self.input_ids[:num_tokens], multimodal_embeddings=mm_embeds, is_multimodal=is_mm_embed
+#             )
+#             self.inputs_embeds[:num_tokens] = inputs_embeds
+#             inputs_embeds = self.inputs_embeds[:num_input_tokens]
+#         else:
+#             inputs_embeds = None
+
+#         # Update slot_mapping for different speculative.
+#         # NOTE: Currently, we only remake the slot_mapping, because it's the
+#         # only tensor which will be used in current FIA.
+#         # Strictly speaking, `query_start_loc`, `seq_lens` should also have
+#         # their memory allocated separately for each step just like `slot_mapping`.
+#         slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
+#         self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping)
+#         self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
+#         common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
+
+#         self.seq_lens_group[0][:num_reqs_padded].copy_(common_attn_metadata.seq_lens)
+#         self.seq_lens_group[0][num_reqs_padded:].fill_(0)
+#         common_attn_metadata.seq_lens = self.seq_lens_group[0][:num_reqs_padded]
+
+#         self.query_start_loc_group[0][: num_reqs_padded + 1].copy_(common_attn_metadata.query_start_loc)
+#         self.query_start_loc_group[0][num_reqs_padded + 1 :].fill_(0)
+#         common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
+
+#         common_attn_metadata.num_input_tokens = num_input_tokens
+#         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
+#         assert len(self.draft_attn_groups) > 0
+#         builder = self.draft_attn_groups[0].get_metadata_builder()
+#         attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model())
+
+#         if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
+#             attn_metadata.attn_mask = None
+
+#         if self.uses_mrope:
+#             used_update_positions = self.mrope_positions[:, token_indices_to_sample]
+#         else:
+#             used_update_positions = self.positions[token_indices_to_sample]
+#         per_layer_attn_metadata = dict()
+#         # The first step of speculative.
+#         for layer_name in self.attn_layer_names:
+#             per_layer_attn_metadata[layer_name] = attn_metadata
+#         multi_steps_attn_metadata = [per_layer_attn_metadata]
+
+#         # Copy the old attn_metadata and update
+#         attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
+
+#         # Clone the data so that when calculating the data at position 2 and position 3
+#         # in the merged graph, it does not affect position 1
+#         # FIXME(lilinsiman)
+#         if self.pcp_size * self.dcp_size > 1 and self.use_cuda_graph:
+#             assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
+#             self.block_table_tensor_clone[: common_attn_metadata.block_table_tensor.shape[0]] = (
+#                 common_attn_metadata.block_table_tensor
+#             )
+#             common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[
+#                 : common_attn_metadata.block_table_tensor.shape[0]
+#             ]
+#         else:
+#             common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
+
+#         if self.pcp_size * self.dcp_size > 1:
+#             if self.num_speculative_tokens > 1 and not attn_metadata_i.num_prefills:
+#                 # For pcp/dcp, tokens are split across different cp ranks,
+#                 # so we can not simply update slot_mapping by += 1.
+#                 # Instead, we pre-allocate mtp slot_mapping in model_runner
+#                 # (_generate_pcp_mtp_input), and use updated slot_indices
+#                 # to get corresponding slot_mapping in each step.
+#                 num_reject_tokens = (
+#                     torch.tensor(self.runner.pcp_manager.cu_num_tokens_pcp_full, dtype=torch.int32).to(self.device)
+#                     - ori_token_indices_to_sample
+#                     - 1
+#                 )
+#                 num_accept_tokens = query_lens_d.to(self.device) - num_reject_tokens
+#                 ori_seq_len = attn_metadata_i.seq_lens_cpu[:batch_size].clone()
+#                 mtp_slot_mapping = self.runner.pcp_manager.mtp_slot_pad
+
+#                 # slot_mapping index base offset:
+#                 # scheduled tokens + pre-allocated mtp tokens + accepted tokens
+#                 slot_idx_base = (
+#                     torch.cat(
+#                         [
+#                             torch.tensor([0], dtype=torch.int32, device=self.device),
+#                             (torch.cumsum(query_lens_d, dim=0)[:-1] * self.pcp_size).to(self.device),
+#                         ]
+#                     )
+#                     + torch.arange(num_decode_reqs, device=self.device)
+#                     * (self.num_speculative_tokens - 1)
+#                     * self.pcp_size
+#                     + (num_accept_tokens - 1) * self.pcp_size
+#                 )
+#                 slot_indices_list = []
+#                 for req_id in range(num_decode_reqs):
+#                     slot_indices_list.append(
+#                         torch.arange(slot_idx_base[req_id], slot_idx_base[req_id] + self.pcp_size, device=self.device)
+#                     )
+#                 slot_indices = torch.cat(slot_indices_list, dim=0)
+
+#                 # fold block_table (restore it to original size before flattened)
+#                 block_indices = torch.cat(
+#                     [torch.tensor([0], dtype=torch.int32), torch.cumsum(query_lens_d, dim=0)[:-1]]
+#                 )
+#                 common_attn_metadata.block_table_tensor[:batch_size] = common_attn_metadata.block_table_tensor[
+#                     block_indices
+#                 ]
+#                 common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor[:batch_size]
+
+#                 # Copy the old attn_metadata and update
+#                 if not self.parallel_drafting:
+#                     for draft_step in range(1, self.num_speculative_tokens):
+#                         per_layer_attn_metadata = dict()
+#                         for attn_group in self.draft_attn_groups:
+#                             common_attn_metadata, attn_metadata = self.attn_update_stack_num_spec_norm(
+#                                 draft_step,
+#                                 attn_metadata,
+#                                 common_attn_metadata,
+#                                 batch_size,
+#                                 num_input_tokens,
+#                                 used_update_positions,
+#                                 aclgraph_runtime_mode,
+#                                 ori_seq_len,
+#                                 slot_indices,
+#                                 mtp_slot_mapping,
+#                                 attn_group=attn_group,
+#                             )
+#                             for layer_name in self.attn_layer_names:
+#                                 per_layer_attn_metadata[layer_name] = attn_metadata
+#                         multi_steps_attn_metadata.append(per_layer_attn_metadata)
+#         else:
+#             # Copy the old attn_metadata and update
+#             # if not self.parallel_drafting:
+#             if False:
+#                 for draft_step in range(1, self.num_speculative_tokens):
+#                     per_layer_attn_metadata = dict()
+#                     for attn_group in self.draft_attn_groups:
+#                         common_attn_metadata, attn_metadata = self.attn_update_stack_num_spec_norm(
+#                             draft_step,
+#                             attn_metadata,
+#                             common_attn_metadata,
+#                             batch_size,
+#                             num_input_tokens,
+#                             used_update_positions,
+#                             aclgraph_runtime_mode,
+#                             attn_group=attn_group,
+#                         )
+#                         for layer_name in self.attn_layer_names:
+#                             per_layer_attn_metadata[layer_name] = attn_metadata
+#                     multi_steps_attn_metadata.append(per_layer_attn_metadata)
+
+#         token_indices_to_sample_len = token_indices_to_sample.shape[0]
+#         self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
+
+#         with set_ascend_forward_context(
+#             # multi_steps_attn_metadata[0],
+#             per_layer_attn_metadata,
+#             self.vllm_config,
+#             num_tokens=num_input_tokens,
+#             num_tokens_across_dp=num_tokens_across_dp,
+#             num_actual_tokens=num_tokens,
+#             batch_descriptor=batch_descriptor,
+#             aclgraph_runtime_mode=aclgraph_runtime_mode,
+#             is_draft_model=True,
+#             # draft_attn_metadatas=multi_steps_attn_metadata,
+#             draft_attn_metadatas=per_layer_attn_metadata,
+#         ):
+#             # Reset MOE layer index for forward pass
+#             forward_context = get_forward_context()
+#             if forward_context is not None:
+#                 forward_context.moe_layer_index = 0
+
+#             model_inputs: dict[str, Any] = {
+#                 "num_input_tokens": num_input_tokens,
+#                 "batch_size": batch_size,
+#                 "token_indices_to_sample": self.token_indices_to_sample[:token_indices_to_sample_len],
+#                 "target_positions": target_positions,
+#                 "inputs_embeds": inputs_embeds,
+#                 "common_attn_metadata": common_attn_metadata,
+#                 "multi_steps_attn_metadata": multi_steps_attn_metadata,
+#                 "num_tokens": num_tokens,
+#                 "is_prefill": attn_metadata_i.num_prefills,
+#             }
+#             run_draft = partial(self._runnable, **model_inputs)
+
+#             if self.enable_enpu:
+#                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+#                 draft_token_ids = run_draft()
+#             else:
+#                 draft_token_ids = run_draft()
+#                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+#         return draft_token_ids
+
+#     def _run_merged_draft(
+#         self,
+#         num_input_tokens,
+#         batch_size,
+#         token_indices_to_sample,
+#         target_positions,
+#         inputs_embeds,
+#         common_attn_metadata,
+#         multi_steps_attn_metadata,
+#         num_tokens,
+#         is_prefill=None,
+#     ) -> torch.Tensor:
+#         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
+#         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
+#         # `model_hidden_states` represent the speculative model inputs.
+
+#         draft_token_ids_list = []
+#         for spec_step_idx in range(self.layer_num):
+#             model_input_ids = self.input_ids[:num_input_tokens]
+#             model_positions = self._get_positions(num_input_tokens)
+
+#             if self.method == "dflash":
+#                 model_kwargs = self.build_model_inputs_first_pass(num_input_tokens)
+#             else:
+#                 model_kwargs = {
+#                     "input_ids": model_input_ids,
+#                     "positions": model_positions,
+#                     "inputs_embeds": inputs_embeds,
+#                 }
+
+#                 if self.pass_hidden_states_to_model:
+#                     model_hidden_states = self.hidden_states[:num_input_tokens]
+#                     model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
+#                     model_kwargs["hidden_states"] = model_hidden_states
+#                     if self.method == "mtp":
+#                         # model_kwargs["positions"] = model_positions
+#                         model_kwargs["spec_step_idx"] = spec_step_idx
+
+#             ret_hidden_states = self.model(**model_kwargs)
+#             if not self.model_returns_tuple():
+#                 last_hidden_states = ret_hidden_states
+#                 hidden_states = last_hidden_states
+#             else:
+#                 last_hidden_states, hidden_states = ret_hidden_states
+
+#             if self.method != "dflash":
+#                 last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
+#                     last_hidden_states, model_positions, hidden_states
+#                 )
+
+#             num_indices = token_indices_to_sample.shape[0]
+#             if self.pcp_size > 1:
+#                 # remove graph padding before all_gather
+#                 hidden_states = hidden_states[:num_input_tokens]
+#                 hidden_states = get_pcp_group().all_gather(hidden_states, 0)
+#                 hidden_states = torch.index_select(
+#                     hidden_states,
+#                     0,
+#                     self.runner.pcp_manager.pcp_allgather_restore_idx.gpu[: num_input_tokens * self.pcp_size],
+#                 )
+#                 if self.method == "mtp":
+#                     last_hidden_states = hidden_states
+#                 else:
+#                     # eagle and eagle3 need allgather last_hidden_states.
+#                     last_hidden_states = last_hidden_states[:num_input_tokens]
+#                     last_hidden_states = get_pcp_group().all_gather(last_hidden_states, 0)
+#                     last_hidden_states = torch.index_select(
+#                         last_hidden_states,
+#                         0,
+#                         self.runner.pcp_manager.pcp_allgather_restore_idx.gpu[: num_input_tokens * self.pcp_size],
+#                     )
+
+#             if lmhead_tp_enable():
+#                 max_num_reqs_across_dp = (
+#                     self.vllm_config.scheduler_config.max_num_seqs * self.runner.uniform_decode_query_len
+#                 )
+#                 token_indices_to_sample = nn.functional.pad(
+#                     token_indices_to_sample, (0, max_num_reqs_across_dp - num_indices)
+#                 )
+
+#             sample_hidden_states = last_hidden_states[token_indices_to_sample]
+#             if self.method == "mtp":
+#                 logits = self.model.compute_logits(
+#                     sample_hidden_states, spec_step_idx=spec_step_idx
+#                 )
+#             else:
+#                 logits = self.model.compute_logits(sample_hidden_states)
+
+#             if lmhead_tp_enable() and num_indices < logits.shape[0]:
+#                 logits = logits[:num_indices]
+#                 token_indices_to_sample = token_indices_to_sample[:num_indices]
+
+#             draft_token_ids = logits.argmax(dim=-1)
+#             draft_token_ids_list.append(draft_token_ids)
+            
+
+
+#             # Generate the remaining draft tokens.
+#             if spec_step_idx < self.layer_num - 1:
+#                 prev_token_ids = self.input_ids[:num_tokens].clone()
+#                 hidden_states = hidden_states[:num_tokens]
+#                 next_token_ids = draft_token_ids_list[-1].int()
+
+#                 num_tokens, token_indices_to_sample, common_attn_metadata = (
+#                     self.set_inputs_first_pass(
+#                         target_token_ids=prev_token_ids,
+#                         next_token_ids=next_token_ids,
+#                         target_positions=target_positions,
+#                         target_hidden_states=hidden_states,
+#                         token_indices_to_sample=token_indices_to_sample,
+#                         cad=common_attn_metadata,
+#                         num_rejected_tokens_gpu=None,
+#                     )
+#                 )
+
+#         # Early exit if there is only one draft token to be generated.
+#         # if self.num_speculative_tokens == 1 or self.parallel_drafting:
+#         if self.num_speculative_tokens == self.layer_num or self.parallel_drafting:
+#             # [batch_size, 1]
+#             # return draft_token_ids.view(-1, self.num_speculative_tokens)
+#             draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+#             return draft_token_ids
+
+#         if self.pcp_size * self.dcp_size > 1 and is_prefill:
+#             draft_token_ids = logits.argmax(dim=-1)
+#             draft_token_ids_list = []
+#             for _ in range(self.num_speculative_tokens):
+#                 draft_token_ids_list.append(draft_token_ids)
+#             return torch.stack(draft_token_ids_list, dim=1)
+
+#         # The logits are split and then merged only when lmhead_tp_enable() is enabled.
+#         # As a result, the batch size length becomes the actual length 32.
+#         # However, when lmhead_tp_enable() is disabled, the batch size uses the length after padding.
+#         # To decouple the scenarios, a judgment is required.
+#         # That is, the batch size needs to be modified only when lmhead_tp_enable() is enabled.
+#         if lmhead_tp_enable() and self.method == "mtp":
+#             batch_size = draft_token_ids.shape[0]
+
+#         # Generate the remaining draft tokens.
+#         draft_token_ids_tensor = torch.zeros(
+#             (self.num_speculative_tokens, *draft_token_ids.shape), dtype=draft_token_ids.dtype, device=self.device
+#         )
+#         draft_token_ids_tensor[0] = draft_token_ids
+#         if self.uses_mrope:
+#             positions = self.mrope_positions[:, token_indices_to_sample]
+#         else:
+#             positions = self.positions[token_indices_to_sample]
+        
+#         if self.method == "mtp":
+#             hidden_states = self.hidden_states[token_indices_to_sample]
+#         else:
+#             hidden_states = hidden_states[token_indices_to_sample]
+#         token_indices_to_sample = self.arange[:batch_size]
+
+#         input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
+
+#         forward_context = get_forward_context()
+#         _EXTRA_CTX.num_tokens = input_batch_size
+#         _EXTRA_CTX.num_accept_tokens = batch_size
+
+#         for draft_step in range(self.num_speculative_tokens - 1):
+#             # Reset MOE layer index for each draft step iteration
+#             forward_context = get_forward_context()
+#             if forward_context is not None:
+#                 forward_context.moe_layer_index = 0
+
+#             # Update the inputs.
+#             # cast to int32 is crucial when eagle model is compiled.
+#             # tensor.argmax() returns int64 by default.
+#             # input_ids = draft_token_ids_tensor[draft_step]
+#             input_ids = draft_token_ids_list[-1].int()
+#             positions += 1
+
+#             # NOTE(woosuk): We should handle the case where the draft model
+#             # generates tokens beyond the max model length. Since it is complex
+#             # to remove such requests from the batch, we keep them in the batch
+#             # but adjust the position ids and slot mappings to avoid the
+#             # out-of-range access during the model execution. The draft tokens
+#             # generated with this adjustment should be ignored.
+#             if self.uses_mrope:
+#                 exceeds_max_model_len = positions[0] >= self.vllm_config.model_config.max_model_len
+#                 # Mask out the position ids that exceed the max model length.
+#                 # Otherwise, we may get out-of-range error in RoPE.
+#                 clamped_positions = torch.where(
+#                     exceeds_max_model_len.unsqueeze(0), torch.zeros_like(positions), positions
+#                 )
+#             else:
+#                 exceeds_max_model_len = positions >= self.vllm_config.model_config.max_model_len
+#                 clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
+
+#             # copy inputs to buffer for cudagraph
+#             self.input_ids[:batch_size] = input_ids
+#             self._set_positions(batch_size, clamped_positions)
+#             self.hidden_states[:batch_size] = hidden_states
+#             if self.supports_mm_inputs:
+#                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
+
+#                 input_ids = self.input_ids[:input_batch_size]
+#                 inputs_embeds = self.inputs_embeds[:input_batch_size]
+#             else:
+#                 input_ids = self.input_ids[:input_batch_size]
+#                 inputs_embeds = None
+
+#             # Run the model.
+
+#             # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
+#             # speculative tokens' proposings. `model_input_ids`, `model_positions` and
+#             # `model_hidden_states` represent the speculative model inputs.
+#             model_input_ids = self.input_ids[:input_batch_size]
+#             model_positions = self._get_positions(input_batch_size)
+#             model_hidden_states = self.hidden_states[:input_batch_size]
+
+#             model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
+
+#             forward_context.attn_metadata = (
+#                 multi_steps_attn_metadata[draft_step + 1] if multi_steps_attn_metadata else None
+#             )
+
+#             model_kwargs = {
+#                 "input_ids": model_input_ids,
+#                 "positions": model_positions,
+#                 "inputs_embeds": inputs_embeds,
+#             }
+#             if self.pass_hidden_states_to_model:
+#                 model_kwargs["hidden_states"] = model_hidden_states
+
+#             ret_hidden_states = self.model(**model_kwargs)
+#             if not self.model_returns_tuple():
+#                 last_hidden_states = ret_hidden_states
+#                 hidden_states = last_hidden_states
+#             else:
+#                 last_hidden_states, hidden_states = ret_hidden_states
+
+#             last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
+#                 last_hidden_states, model_positions, hidden_states
+#             )
+
+#             num_indices = token_indices_to_sample.shape[0]
+#             if lmhead_tp_enable():
+#                 max_num_reqs_across_dp = (
+#                     self.vllm_config.scheduler_config.max_num_seqs * self.runner.uniform_decode_query_len
+#                 )
+#                 token_indices_to_sample = nn.functional.pad(
+#                     token_indices_to_sample,
+#                     (0, max_num_reqs_across_dp - num_indices),
+#                 )
+
+#             sample_hidden_states = last_hidden_states[token_indices_to_sample]
+#             logits = self.model.compute_logits(sample_hidden_states)
+
+#             if lmhead_tp_enable() and num_indices < logits.shape[0]:
+#                 logits = logits[:num_indices]
+#                 token_indices_to_sample = token_indices_to_sample[:num_indices]
+
+#             # TODO(wenlong): get more than one token for tree attention
+#             hidden_states = hidden_states[:batch_size]
+#             draft_token_ids = logits.argmax(dim=-1)
+#             # draft_token_ids_tensor[draft_step + 1] = draft_token_ids
+
+#         # [batch_size, num_speculative_tokens]
+#         # draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
+#         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+#         return draft_token_ids
+    
+# def _multi_layer_eagle_shift_and_cache(
+#     *,
+#     batch_size: int,
+#     max_shift: int,
+#     src_token_ids: torch.Tensor,
+#     dst_token_ids: torch.Tensor,
+#     src_positions: torch.Tensor,
+#     dst_positions: torch.Tensor,
+#     src_hidden_states: torch.Tensor,
+#     dst_hidden_states: torch.Tensor,
+#     src_slot_mapping: torch.Tensor,
+#     dst_slot_mapping: torch.Tensor,
+#     start_token_indices: torch.Tensor,
+#     end_token_indices: torch.Tensor,
+#     token_indices_to_sample: torch.Tensor,
+#     shift: torch.Tensor,
+#     cached_lens: torch.Tensor,
+#     cached_prev_token_ids: torch.Tensor,
+#     cached_prev_positions: torch.Tensor,
+#     cached_prev_hidden_states: torch.Tensor,
+#     cached_slot_mappings: torch.Tensor,
+#     common_attn_metadata: CommonAttentionMetadata,
+# ):
+#     if batch_size == 0:
+#         return
+
+#     assert max_shift > 0
+
+#     assert cached_prev_positions.is_contiguous()
+#     assert cached_prev_token_ids.is_contiguous()
+#     assert cached_prev_hidden_states.is_contiguous()
+#     assert cached_slot_mappings.is_contiguous()
+#     assert src_hidden_states.is_contiguous()
+#     assert dst_hidden_states.is_contiguous()
+
+#     if src_slot_mapping.data_ptr() == dst_slot_mapping.data_ptr():
+#         src_slot_mapping = src_slot_mapping.clone()
+
+#     store_start = torch.maximum(
+#         start_token_indices,
+#         (token_indices_to_sample + 1 - max_shift),
+#     )
+#     store_lens = torch.clamp(
+#         token_indices_to_sample - store_start + 1,
+#         min=0,
+#         max=max_shift,
+#     )
+
+#     pad_shift = max(1, 2 ** (math.ceil(math.log2(max_shift)) if max_shift > 1 else 0))
+
+#     # Triton kernel path: parallelized shift+gather
+#     num_reqs = start_token_indices.shape[0]
+#     max_window_len = int(
+#         (
+#             common_attn_metadata.query_start_loc_cpu[1:]
+#             - common_attn_metadata.query_start_loc_cpu[:-1]
+#         )
+#         .max()
+#         .item()
+#     )
+#     num_blocks = max(1, (max_window_len + BLOCK_TOKENS - 1) // BLOCK_TOKENS)
+
+#     _shift_and_gather_cache_1d_kernel[(num_reqs, num_blocks)](
+#         src_token_ids,
+#         dst_token_ids,
+#         cached_prev_token_ids,
+#         start_token_indices,
+#         end_token_indices,
+#         shift,
+#         cached_lens,
+#         store_start,
+#         store_lens,
+#         MAX_SHIFT=max_shift,
+#         PADDED_SHIFT=triton.next_power_of_2(max_shift),
+#         BLOCK_TOKENS=BLOCK_TOKENS,
+#     )
+
+#     _shift_and_gather_cache_1d_kernel[(num_reqs, num_blocks)](
+#         src_slot_mapping,
+#         dst_slot_mapping,
+#         cached_slot_mappings,
+#         start_token_indices,
+#         end_token_indices,
+#         shift,
+#         cached_lens,
+#         store_start,
+#         store_lens,
+#         MAX_SHIFT=max_shift,
+#         PADDED_SHIFT=triton.next_power_of_2(max_shift),
+#         BLOCK_TOKENS=BLOCK_TOKENS,
+#     )
+    
+#     _shift_and_gather_cache_1d_kernel[(num_reqs, num_blocks)](
+#         src_positions,
+#         dst_positions,
+#         cached_prev_positions,
+#         start_token_indices,
+#         end_token_indices,
+#         shift,
+#         cached_lens,
+#         store_start,
+#         store_lens,
+#         MAX_SHIFT=max_shift,
+#         PADDED_SHIFT=triton.next_power_of_2(max_shift),
+#         BLOCK_TOKENS=BLOCK_TOKENS,
+#     )
+
+#     hidden_size = int(dst_hidden_states.shape[1])
+#     num_hidden_blocks = max(1, (hidden_size + BLOCK_HIDDEN - 1) // BLOCK_HIDDEN)
+
+#     _shift_and_gather_hidden_kernel[(num_reqs, num_blocks, num_hidden_blocks)](
+#         src_hidden_states,
+#         dst_hidden_states,
+#         cached_prev_hidden_states,
+#         start_token_indices,
+#         end_token_indices,
+#         shift,
+#         cached_lens,
+#         store_start,
+#         store_lens,
+#         MAX_SHIFT=max_shift,
+#         PADDED_SHIFT=triton.next_power_of_2(max_shift),
+#         HIDDEN_SIZE=hidden_size,
+#         BLOCK_TOKENS=BLOCK_TOKENS,
+#         BLOCK_HIDDEN=BLOCK_HIDDEN,
+#         num_warps=4,
+#     )
+
+#     cached_lens.copy_(store_lens)
+#     return
+
+# @triton.jit
+# def _shift_and_gather_cache_1d_kernel(
+#     src_ptr,
+#     dst_ptr,
+#     cached_ptr,
+#     start_ptr,
+#     end_ptr,
+#     shift_ptr,
+#     cached_len_ptr,
+#     store_start_ptr,
+#     store_len_ptr,
+#     MAX_SHIFT: tl.constexpr,
+#     PADDED_SHIFT: tl.constexpr,
+#     BLOCK_TOKENS: tl.constexpr,
+# ):
+#     pid_seq = tl.program_id(0)
+#     pid_blk = tl.program_id(1)
+
+#     start = tl.load(start_ptr + pid_seq).to(tl.int32)
+#     end = tl.load(end_ptr + pid_seq).to(tl.int32)
+#     shift = tl.load(shift_ptr + pid_seq).to(tl.int32)
+#     cached_len = tl.load(cached_len_ptr + pid_seq).to(tl.int32)
+
+#     assert cached_len >= shift
+
+#     # get dst indices
+#     base = pid_blk * BLOCK_TOKENS
+#     k = tl.arange(0, BLOCK_TOKENS)
+#     offs = base + k
+#     dst_idx = start + offs
+
+#     # get dst mask
+#     window_len = end - start + 1
+#     mask = offs < window_len
+
+#     # load from cached
+#     base_cached = cached_ptr + pid_seq * MAX_SHIFT
+#     cached_idx = cached_len - shift + offs
+#     cached_mask = offs < shift
+#     safe_cached_idx = tl.where(cached_mask, cached_idx, 0)
+#     val_cached = tl.load(base_cached + safe_cached_idx, mask=mask & cached_mask, other=0)
+
+#     # load from src
+#     src_idx = start + offs - shift
+#     safe_src_idx = tl.where(src_idx >= 0, src_idx, 0)
+#     val_src = tl.load(src_ptr + safe_src_idx, mask=mask & ~cached_mask, other=0)
+
+#     # store to dst
+#     val = tl.where(cached_mask, val_cached, val_src)
+#     tl.store(dst_ptr + dst_idx, val, mask=mask)
+
+#     # Store into the per-sequence cache.
+#     store_start = tl.load(store_start_ptr + pid_seq).to(tl.int32)
+#     store_len = tl.load(store_len_ptr + pid_seq).to(tl.int32)
+#     m = tl.arange(0, PADDED_SHIFT)
+#     store_mask = m < MAX_SHIFT
+#     dst_idx = store_start + m
+#     safe_dst_idx = tl.where(store_mask & (m < store_len), dst_idx, 0)
+#     safe_m = tl.where(store_mask, m, 0)
+#     val = tl.load(dst_ptr + safe_dst_idx, mask=store_mask & (m < store_len), other=0)
+#     tl.store(base_cached + safe_m, val, mask=store_mask)
+    
+# @triton.jit
+# def _shift_and_gather_hidden_kernel(
+#     src_ptr,
+#     dst_ptr,
+#     cached_ptr,
+#     start_ptr,
+#     end_ptr,
+#     shift_ptr,
+#     cached_len_ptr,
+#     store_start_ptr,
+#     store_len_ptr,
+#     MAX_SHIFT: tl.constexpr,
+#     PADDED_SHIFT: tl.constexpr,
+#     HIDDEN_SIZE: tl.constexpr,
+#     BLOCK_TOKENS: tl.constexpr,
+#     BLOCK_HIDDEN: tl.constexpr,
+# ):
+#     pid_seq = tl.program_id(0)
+#     pid_blk = tl.program_id(1)
+#     pid_hid = tl.program_id(2)
+
+#     start = tl.load(start_ptr + pid_seq).to(tl.int32)
+#     end = tl.load(end_ptr + pid_seq).to(tl.int32)
+#     shift = tl.load(shift_ptr + pid_seq).to(tl.int32)
+#     cached_len = tl.load(cached_len_ptr + pid_seq).to(tl.int32)
+
+#     assert cached_len >= shift
+
+#     # get dst indices
+#     base = pid_blk * BLOCK_TOKENS
+#     k = tl.arange(0, BLOCK_TOKENS)
+#     tok_offs = base + k
+#     dst_tok = start + tok_offs
+#     n = pid_hid * BLOCK_HIDDEN + tl.arange(0, BLOCK_HIDDEN)
+#     dst_ptrs = dst_ptr + dst_tok[:, None] * HIDDEN_SIZE + n[None, :] * 1
+
+#     # get dst mask
+#     window_len = end - start + 1
+#     tok_mask = tok_offs < window_len
+#     n_mask = n < HIDDEN_SIZE
+#     mask = tok_mask[:, None] & n_mask[None, :]
+
+#     # load from cached
+#     base_cached = cached_ptr + pid_seq * HIDDEN_SIZE * MAX_SHIFT
+#     cached_tok = cached_len - shift + tok_offs
+#     safe_cached_tok = tl.where(tok_offs < shift, cached_tok, 0)
+#     cached_ptrs = base_cached + safe_cached_tok[:, None] * HIDDEN_SIZE + n[None, :] * 1
+#     cached_mask = tok_offs < shift
+#     val_cached = tl.load(cached_ptrs, mask=mask & cached_mask[:, None], other=0)
+
+#     # load from src
+#     src_tok = start + tok_offs - shift
+#     safe_src_tok = tl.where(src_tok >= 0, src_tok, 0)
+#     src_ptrs = src_ptr + safe_src_tok[:, None] * HIDDEN_SIZE + n[None, :] * 1
+#     val_src = tl.load(src_ptrs, mask=mask & ~cached_mask[:, None], other=0)
+
+#     # store to dst
+#     val = tl.where(cached_mask[:, None], val_cached, val_src)
+#     tl.store(dst_ptrs, val, mask=mask)
+
+#     # store to cached
+#     store_start = tl.load(store_start_ptr + pid_seq).to(tl.int32)
+#     store_len = tl.load(store_len_ptr + pid_seq).to(tl.int32)
+#     m = tl.arange(0, PADDED_SHIFT)
+#     m_mask = (m < MAX_SHIFT) & (m < store_len)
+#     store_tok = store_start + m
+#     safe_store_tok = tl.where(m_mask, store_tok, 0)
+#     safe_m = tl.where(m < MAX_SHIFT, m, 0)
+#     dst_ptrs = dst_ptr + safe_store_tok[:, None] * HIDDEN_SIZE + n[None, :] * 1
+#     store_ptrs = base_cached + safe_m[:, None] * HIDDEN_SIZE + n[None, :] * 1
+#     mask = m_mask[:, None] & n_mask[None, :]
+#     val = tl.load(dst_ptrs, mask=mask, other=0)
+#     tl.store(store_ptrs, val, mask=mask)
+
+            
+# class AscendMultiLayerEagleProposer(MultiLayerEagleProposer):
+#     def __init__(
+#         self,
+#         vllm_config: VllmConfig,
+#         device: torch.device,
+#         runner=None,
+#     ):
+#         super().__init__(
+#             vllm_config,
+#             device,
+#             pass_hidden_states_to_model=True,
+#             runner=runner,
+#         )

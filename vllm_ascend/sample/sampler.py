@@ -165,7 +165,8 @@ def _apply_top_k_top_p_ascendc(
 
 
 apply_top_k_top_p = (
-    _apply_top_k_top_p_ascendc
-    if get_ascend_device_type() in [AscendDeviceType.A2, AscendDeviceType.A3]
-    else _apply_top_k_top_p_pytorch
+    # _apply_top_k_top_p_ascendc
+    # if get_ascend_device_type() in [AscendDeviceType.A2, AscendDeviceType.A3]
+    # else _apply_top_k_top_p_pytorch
+    _apply_top_k_top_p_pytorch
 )

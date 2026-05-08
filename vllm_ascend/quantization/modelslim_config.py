@@ -252,6 +252,18 @@ packed_modules_model_mapping: dict[str, dict[str, list[str]]] = {
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
         "o_proj": ["dense"],
     },
+    "step3p5": {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+        "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
+    },
 }
 
 
@@ -459,6 +471,9 @@ class AscendModelSlimConfig(QuantizationConfig):
         return None
 
     def quant_prefix_mapper(self, model_type: str, prefix: str) -> str:
+        # if model_type == "step3p5":
+        #     prefix = prefix.replace(".moe.share_expert", ".share_expert")
+        #     prefix = prefix.replace(".mtp_block.", ".")
         self.model_type = model_type
         return prefix
 

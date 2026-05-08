@@ -47,6 +47,8 @@ class NPUInputBatch(InputBatch):
         is_pooling_model: bool = False,
         num_speculative_tokens: int = 0,
         cp_kv_cache_interleave_size: int = 1,
+        multi_layer_eagle_num: int = 0,
+        hidden_size: int | None = None,
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
@@ -167,6 +169,46 @@ class NPUInputBatch(InputBatch):
             (max_num_reqs,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
         )
         self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
+
+        # Multi layer eagle
+        self.multi_layer_eagle_num = multi_layer_eagle_num
+        if multi_layer_eagle_num > 0:
+            self.cached_len = torch.zeros(
+                (max_num_reqs,), dtype=torch.int64, device=device
+            )
+            self.cached_token_ids = torch.zeros(
+                (
+                    max_num_reqs,
+                    multi_layer_eagle_num,
+                ),
+                dtype=torch.int32,
+                device=device,
+            )
+            self.cached_hidden_states = torch.zeros(
+                (
+                    max_num_reqs,
+                    multi_layer_eagle_num,
+                    hidden_size,
+                ),
+                dtype=torch.float,
+                device=device,
+            )
+            self.cached_slot_mappings = torch.zeros(
+                (
+                    max_num_reqs,
+                    multi_layer_eagle_num,
+                ),
+                dtype=torch.int64,
+                device=device,
+            )
+            self.cached_positions = torch.zeros(
+                (
+                    max_num_reqs,
+                    multi_layer_eagle_num,
+                ),
+                dtype=torch.int64,
+                device=device,
+            )
 
         # lora related
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
