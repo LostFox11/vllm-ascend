@@ -23,6 +23,7 @@ import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
+    Llama3RotaryEmbedding,
     MRotaryEmbedding,
     RotaryEmbedding,
     YaRNScalingRotaryEmbedding,
@@ -77,11 +78,22 @@ def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype, devi
         _sin_mla = torch.zeros(max_num_batched_tokens, 1, 1, rope_dim, dtype=dtype, device=device)
     elif not is_vl_model(vllm_config) and has_rope(vllm_config):
         rope_dim = model_config.get_head_size()
-        # For models using partial rope like Qwen3-Next.
-        if hasattr(model_config.hf_text_config, "partial_rotary_factor"):
-            rope_dim = int(rope_dim * model_config.hf_text_config.partial_rotary_factor)
-        elif hasattr(model_config.hf_text_config, "rotary_dim"):
-            rope_dim = int(model_config.hf_text_config.rotary_dim)
+        hf = model_config.hf_text_config
+        # Keep in sync with vLLM get_rope() / get_rope_dim(): partial rope width for buffers.
+        if hasattr(hf, "partial_rotary_factor"):
+            rope_dim = int(rope_dim * hf.partial_rotary_factor)
+        else:
+            partial_rotary_factors = getattr(hf, "partial_rotary_factors", None)
+            if partial_rotary_factors:
+                rope_dim = int(rope_dim * partial_rotary_factors[0])
+            elif hasattr(hf, "rotary_dim"):
+                rope_dim = int(hf.rotary_dim)
+            else:
+                rope_params = getattr(hf, "rope_parameters", None)
+                if isinstance(rope_params, dict):
+                    pr = rope_params.get("partial_rotary_factor")
+                    if pr is not None:
+                        rope_dim = int(rope_dim * pr)
         _cos = torch.ones(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
         _sin = torch.zeros(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
 
@@ -248,6 +260,48 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         return torch.ops.vllm.npu_rotary_embedding(
             positions, query, key, self.cos_sin_cache, self.head_size, self.rotary_dim, is_neox_style
         )
+
+
+class AscendLlama3RotaryEmbedding(Llama3RotaryEmbedding):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        scaling_factor: float,
+        low_freq_factor: float,
+        high_freq_factor: float,
+        orig_max_position: int,
+    ) -> None:
+        super().__init__(
+            head_size,
+            rotary_dim,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            dtype,
+            scaling_factor,
+            low_freq_factor,
+            high_freq_factor,
+            orig_max_position,
+        )
+        vllm_config = get_current_vllm_config()
+        self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
+        _record_cos_sin_cache(self.cos_sin_cache)
+        _record_cos_and_sin_cache_interleaved(self.cos_sin_cache)
+
+    def forward_oot(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: torch.Tensor | None = None,
+        is_neox_style_override: bool | None = None,
+    ):
+        return AscendRotaryEmbedding.forward_oot(self, positions, query, key, offsets, is_neox_style_override)
 
 
 class AscendYaRNRotaryEmbedding(YaRNScalingRotaryEmbedding):
