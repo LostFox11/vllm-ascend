@@ -507,16 +507,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         num_kv_heads,
                         num_heads,
                         scale,
-                        sliding_window,
                         attn_output,
                         softmax_lse,
+                        sparse_mode,
+                        pre_tokens,
+                        next_tokens,
                         c8_k_aq_scale,
                         c8_k_aq_offset,
                         c8_v_aq_scale,
                         c8_v_aq_offset,
                     ) = param
 
-                    sparse_mode = 3
                     if _EXTRA_CTX.is_draft_model:
                         draft_step = attn_count // num_layers
                         seq_lens = attn_metadata[draft_step][key].seq_lens_list
@@ -528,20 +529,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     else:
                         seq_lens = attn_metadata[key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
+                        # block_tables = attn_metadata[key].block_tables
+                    if not hasattr(vllm_config.model_config.hf_text_config, "sliding_window"):
                         block_tables = attn_metadata[key].block_tables
-
-                    if sliding_window is not None:
-                        sparse_mode=4
-                        extra_args = {
-                            "pre_tokens": sliding_window,
-                            "next_tokens": 0,
-                        }
-                    else:
-                        sparse_mode=3
-                        extra_args = {
-                            "pre_tokens": SWA_INT_MAX,
-                            "next_tokens": SWA_INT_MAX,
-                        }
 
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     input_layout = "TND"
@@ -571,6 +561,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         num_heads=num_heads,
                         scale=scale,
                         sparse_mode=sparse_mode,
+                        pre_tokens=pre_tokens,
+                        next_tokens=next_tokens,
                         **extra_args,
                         workspace=graph_params.workspaces.get(num_tokens),
                         out=[attn_output, softmax_lse],
@@ -619,7 +611,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         input_layout = "TND"
         attn_mask = attn_metadata.attn_mask
-        sparse_mode = 3 if attn_metadata.causal else 0
+        sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
+        pre_tokens = self.sliding_window or SWA_INT_MAX
+        next_tokens = 0 if self.sliding_window else SWA_INT_MAX
         extra_args = {}
         if self.enable_c8_quant:
             extra_args = {
@@ -636,18 +630,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             output = output.unsqueeze(2)
             attn_mask = None
             sparse_mode = 0
-        if self.sliding_window is not None:
-            sparse_mode=4
-            extra_args = {
-                "pre_tokens": self.sliding_window,
-                "next_tokens": 0,
-            }
-        else:
-            sparse_mode=3
-            extra_args = {
-                "pre_tokens": SWA_INT_MAX,
-                "next_tokens": SWA_INT_MAX,
-            }
+        
         if workspace is None:
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query=query,
@@ -662,6 +645,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_key_value_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
                 sparse_mode=sparse_mode,
+                pre_tokens=pre_tokens,
+                next_tokens=next_tokens,
                 scale=self.scale,
                 **extra_args,
             )
@@ -689,9 +674,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
             self.num_kv_heads,
             self.num_heads,
             self.scale,
-            self.sliding_window,
             weak_ref_tensors(output),
             weak_ref_tensors(softmax_lse),
+            sparse_mode,
+            pre_tokens,
+            next_tokens,
         )
         if self.enable_c8_quant:
             attn_params = attn_params + (
@@ -719,6 +706,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             num_heads=self.num_heads,
             scale=self.scale,
             sparse_mode=sparse_mode,
+            pre_tokens=pre_tokens,
+            next_tokens=next_tokens,
             workspace=workspace,
             out=[output, softmax_lse],
             **extra_args,
