@@ -186,9 +186,9 @@ def quant_apply_mlp(
                     group_list_type=group_list_type,
                     group_type=0,
                     group_list=group_list,
-                    output_dtype=_output_dtype,
-                    scale_dtype=scale_type,
-                    per_token_scale_dtype=per_token_scale_dtype,
+                    output_dtype=torch.bfloat16,
+                    scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                    per_token_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
                 )[0]
             else:
                 hidden_states = torch_npu.npu_grouped_matmul(
