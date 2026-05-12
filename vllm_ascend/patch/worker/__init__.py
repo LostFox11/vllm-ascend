@@ -21,7 +21,7 @@ from vllm_ascend.utils import is_310p
 
 if HAS_TRITON:
     import vllm_ascend.patch.worker.patch_triton
-    import vllm_ascend.patch.worker.patch_v2.patch_triton  # noqa
+    # import vllm_ascend.patch.worker.patch_v2.patch_triton  # noqa
 
 
 # isort: off
