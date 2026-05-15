@@ -84,21 +84,32 @@ class EplbUpdator:
             self.cur_iterations = 0
 
     def get_update_info_flag(self):
-        return self.cur_iterations == (self.expert_heat_collection_interval + self.algorithm_execution_interval - 1)
+        ret = self.cur_iterations == (self.expert_heat_collection_interval + self.algorithm_execution_interval - 1)
+        if ret:
+            logger.info("[EPLB TRACE] get_update_info_flag TRUE at iter %s", self.cur_iterations)
+        return ret
 
     def wakeup_eplb_worker_flag(self):
-        return self.cur_iterations == (self.expert_heat_collection_interval - 1)
+        ret = self.cur_iterations == (self.expert_heat_collection_interval - 1)
+        if ret:
+            logger.info("[EPLB TRACE] wakeup_eplb_worker_flag TRUE at iter %s", self.cur_iterations)
+        return ret
 
     def update_expert_weight_flag(self):
         weight_update_counter = self.cur_iterations - (
             self.expert_heat_collection_interval + self.algorithm_execution_interval
         )
-        return weight_update_counter >= 0 and weight_update_counter < self.num_moe_layers
+        ret = weight_update_counter >= 0 and weight_update_counter < self.num_moe_layers
+        if ret:
+            logger.info("[EPLB TRACE] update_expert_weight_flag TRUE at iter %s (counter=%s)",
+                        self.cur_iterations, weight_update_counter)
+        return ret
 
     def wakeup_eplb_worker(self):
         self.eplb_process.planner_q.put(1)
 
     def forward_before(self):
+        logger.info("[EPLB TRACE] forward_before ENTER cur_iterations=%s", self.cur_iterations)
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
             logger.info("[EPLB DEBUG] About to block on block_update_q.get() at iteration %s", self.cur_iterations)
@@ -129,6 +140,7 @@ class EplbUpdator:
             self.eplb_loader.asyn_expert_weight_transfer(self.reqs)
 
     def forward_end(self):
+        logger.info("[EPLB TRACE] forward_end ENTER cur_iterations=%s", self.cur_iterations)
         if self.wakeup_eplb_worker_flag():
             self.compute_and_set_moe_load()
             self.wakeup_eplb_worker()
