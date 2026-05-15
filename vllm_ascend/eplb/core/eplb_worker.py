@@ -349,7 +349,9 @@ class EplbProcess:
                 logger.info("[EPLB DEBUG] Worker rank_id=%s finished do_update, packed=%s",
                             self.worker.rank_id, packed_update_info is not None)
 
+                logger.info("[EPLB DEBUG] Worker rank_id=%s about to put into block_update_q", self.worker.rank_id)
                 block_update_q.put(packed_update_info)
+                logger.info("[EPLB DEBUG] Worker rank_id=%s put into block_update_q OK", self.worker.rank_id)
 
             except Exception as e:
                 logger.warning(

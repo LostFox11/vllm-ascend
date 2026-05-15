@@ -103,7 +103,7 @@ class EplbUpdator:
         if self.get_update_info_flag():
             logger.info("[EPLB DEBUG] About to block on block_update_q.get() at iteration %s", self.cur_iterations)
             self.update_info_all = self.eplb_process.block_update_q.get()
-            logger.info("[EPLB DEBUG] Got from block_update_q, len=%s",
+            logger.info("[EPLB DEBUG] Got from block_update_q in forward_before, len=%s",
                         len(self.update_info_all) if self.update_info_all else 0)
         if self.update_expert_weight_flag():
             remaining = len(self.update_info_all) if self.update_info_all else 0
