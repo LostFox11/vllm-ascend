@@ -101,8 +101,16 @@ class EplbUpdator:
     def forward_before(self):
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
+            logger.info("[EPLB DEBUG] About to block on block_update_q.get() at iteration %s", self.cur_iterations)
             self.update_info_all = self.eplb_process.block_update_q.get()
+            logger.info("[EPLB DEBUG] Got from block_update_q, len=%s",
+                        len(self.update_info_all) if self.update_info_all else 0)
         if self.update_expert_weight_flag():
+            remaining = len(self.update_info_all) if self.update_info_all else 0
+            expert_send_info = self.update_info_all[0][0] if self.update_info_all else []
+            expert_recv_info = self.update_info_all[0][1] if self.update_info_all else []
+            logger.info("[EPLB DEBUG] D2D transfer layer: remaining=%d, send=%d, recv=%d",
+                        remaining, len(expert_send_info), len(expert_recv_info))
             (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = self.update_info_all.pop(
                 0
             )
@@ -126,7 +134,9 @@ class EplbUpdator:
             self.wakeup_eplb_worker()
 
         if self.update_expert_weight_flag() and self.expert_map_record_path is None:
+            logger.info("[EPLB DEBUG] Calling update_expert_map_and_weight with %d reqs", len(self.reqs))
             self.eplb_loader.update_expert_map_and_weight(self.reqs)
+            logger.info("[EPLB DEBUG] update_expert_map_and_weight completed")
 
         self.update_iteration()
 
