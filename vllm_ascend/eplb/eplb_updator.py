@@ -154,7 +154,19 @@ class EplbUpdator:
 
     def compute_and_set_moe_load(self):
         local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)
-        moe_load = self.comm_group.all_gather(local_load, dim=1).cpu()
+
+        # Bypass self.comm_group.all_gather (which uses torch.ops.vllm.all_gather
+        # custom op) to avoid potential hang on Ascend NPU with dynamic groups.
+        # Use torch.distributed native all_gather on the device_group directly.
+        world_size = self.comm_group.world_size
+        if world_size > 1:
+            gather_list = [
+                torch.empty_like(local_load) for _ in range(world_size)
+            ]
+            dist.all_gather(gather_list, local_load.contiguous(), group=self.comm_group.device_group)
+            moe_load = torch.cat(gather_list, dim=1).cpu()
+        else:
+            moe_load = local_load.cpu()
 
         if self.multi_stage:
             moe_load = moe_load.permute(2, 0, 1, 3)

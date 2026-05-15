@@ -1764,9 +1764,15 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            if self.dynamic_eplb:
+                logger.info("[EPLB TRACE] _model_forward ENTER cur_iterations=%s",
+                            self.eplb_updator.cur_iterations)
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if self.dynamic_eplb:
+                logger.info("[EPLB TRACE] _model_forward EXIT cur_iterations=%s",
+                            self.eplb_updator.cur_iterations)
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
