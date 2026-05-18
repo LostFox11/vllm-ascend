@@ -331,7 +331,6 @@ def _native_select_experts(
 
     # Required by npu_moe_init_routing
     topk_ids = topk_ids.to(torch.int32)
-    routed_scaling_factor = 3.0
     if routed_scaling_factor != 1.0:
         topk_weights = _renormalize_topk_weights(topk_weights, renormalize) * routed_scaling_factor
     else:
