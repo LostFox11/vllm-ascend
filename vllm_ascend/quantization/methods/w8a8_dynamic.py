@@ -127,16 +127,13 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         self.in_dtype = vllm_config.model_config.dtype
         self.supports_eplb = True
 
-        try:
-            device_group = get_mc2_group().device_group
-            # MC2 groups are isolated per PP stage, so local rank within
-            # the group is unique per device and avoids HCCL duplicate
-            # device IP errors when PP > 1.
-            local_rank = torch.distributed.get_rank(group=device_group)
-            backend = device_group._get_backend(torch.device("npu"))
-            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
-        except AttributeError:
-            self.moe_all_to_all_group_name = ""
+        # NOTE: moe_all_to_all_group_name is intentionally not set here.
+        # The token_dispatcher (TokenDispatcherWithMC2 / MoETokenDispatcherV2)
+        # sets its own copy at runtime, which is what moe_comm_method
+        # actually consumes. Calling get_hccl_comm_name here is unnecessary
+        # and crashes with PP > 1 because HCCL's hcclCommInitRootInfoConfig
+        # spans all global ranks regardless of the process group, leading
+        # to duplicate device IP errors when two PP stages share an NPU.
 
     def get_weight(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
