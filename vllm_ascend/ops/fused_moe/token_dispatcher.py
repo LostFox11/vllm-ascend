@@ -191,6 +191,14 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             self.moe_expert_num = total_expert_num // self._num_dp_groups
             dp_offset = self._dp_rank * self.moe_expert_num
             topk_ids = topk_ids - dp_offset
+            # Mask expert IDs outside this DP's range. The router may still
+            # assign tokens to experts on other DP processes. Their weights are
+            # already zeroed by expert_map, but the MC2 operator routes based
+            # on expert_id // experts_per_rank, and with ep_world_size=4
+            # (TP-local), IDs beyond 0..moe_expert_num-1 go to non-existent
+            # ranks.  Setting them to 0 is safe since weight=0 eliminates them.
+            invalid = (topk_ids < 0) | (topk_ids >= self.moe_expert_num)
+            topk_ids = topk_ids.masked_fill(invalid, 0)
         else:
             self.moe_expert_num = len(expert_map) + global_redundant_expert_num
         kwargs_mc2 = {
