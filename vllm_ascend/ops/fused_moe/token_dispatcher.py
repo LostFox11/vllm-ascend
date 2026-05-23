@@ -90,10 +90,22 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         device_group = get_mc2_group().device_group
-        # TODO: Try local_rank = ep_group.rank_in_group
-        local_rank = torch.distributed.get_rank(group=device_group)
         backend = device_group._get_backend(torch.device("npu"))
-        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+        # Use global rank to avoid HCCL communicator name collisions
+        # across PP stages.  When PP > 1, different stages have the same
+        # local rank in their respective subgroup but the name returned by
+        # get_hccl_comm_name collides, causing npu_moe_distribute_dispatch_v2
+        # to look up the wrong communicator on a multi-process-per-device
+        # NPU.  Using global_rank gives a unique name per process.
+        try:
+            global_rank = torch.distributed.get_rank()
+            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(global_rank)
+        except RuntimeError:
+            # Fallback: if global_rank triggers world-level HCCL init,
+            # use the group-local rank instead.  Name collisions are still
+            # possible across PP stages, but this is the safe fallback.
+            local_rank = torch.distributed.get_rank(group=device_group)
+            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
         self.ep_rank_id = get_mc2_group().rank_in_group
         self.ep_world_size = get_mc2_group().world_size
         self.enable_dispatch_v2 = hasattr(torch_npu, "npu_moe_distribute_dispatch_v2")
@@ -440,9 +452,13 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             )
 
         # TODO: Try local_rank = ep_group.rank_in_group
-        local_rank = torch.distributed.get_rank(group=self.ep_group)
         backend = self.ep_group._get_backend(torch.device("npu"))
-        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+        try:
+            global_rank = torch.distributed.get_rank()
+            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(global_rank)
+        except RuntimeError:
+            local_rank = torch.distributed.get_rank(group=self.ep_group)
+            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
 
     def token_dispatch(
         self,
