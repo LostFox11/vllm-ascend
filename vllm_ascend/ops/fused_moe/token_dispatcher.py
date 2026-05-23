@@ -89,29 +89,44 @@ class MoETokenDispatcher(ABC, Generic[TMoECombineMetadata]):
 class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        device_group = get_mc2_group().device_group
+        vllm_config = get_current_vllm_config()
+
+        # In data_parallel_external_lb mode, each DP process is independent.
+        # MC2 groups span DP*TP ranks across processes, causing HCCL all-to-all
+        # timeout. Override to use TP-local groups for communication.
+        self._use_local_tp = False
+        self._num_dp_groups = 1
+        self._dp_rank = 0
+        if getattr(vllm_config.parallel_config, 'data_parallel_external_lb', False):
+            from vllm.distributed.parallel_state import get_tp_group
+            tp_group = get_tp_group()
+            device_group = tp_group.device_group
+            self.ep_rank_id = tp_group.rank_in_group
+            self.ep_world_size = tp_group.world_size
+            mc2_group = get_mc2_group()
+            self._num_dp_groups = mc2_group.world_size // tp_group.world_size
+            self._dp_rank = mc2_group.rank_in_group // tp_group.world_size
+            self._use_local_tp = True
+        else:
+            device_group = get_mc2_group().device_group
+            self.ep_rank_id = get_mc2_group().rank_in_group
+            self.ep_world_size = get_mc2_group().world_size
+
         backend = device_group._get_backend(torch.device("npu"))
         # Use global rank to avoid HCCL communicator name collisions
-        # across PP stages.  When PP > 1, different stages have the same
-        # local rank in their respective subgroup but the name returned by
-        # get_hccl_comm_name collides, causing npu_moe_distribute_dispatch_v2
-        # to look up the wrong communicator on a multi-process-per-device
-        # NPU.  Using global_rank gives a unique name per process.
+        # across PP stages.
         try:
             global_rank = torch.distributed.get_rank()
             self.moe_all_to_all_group_name = backend.get_hccl_comm_name(global_rank)
         except RuntimeError:
             # Fallback: if global_rank triggers world-level HCCL init,
-            # use the group-local rank instead.  Name collisions are still
-            # possible across PP stages, but this is the safe fallback.
+            # use the group-local rank instead.
             local_rank = torch.distributed.get_rank(group=device_group)
             self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
-        self.ep_rank_id = get_mc2_group().rank_in_group
-        self.ep_world_size = get_mc2_group().world_size
         self.enable_dispatch_v2 = hasattr(torch_npu, "npu_moe_distribute_dispatch_v2")
         self.need_extra_args = get_ascend_device_type() in [AscendDeviceType.A3, AscendDeviceType.A5]
         self.a5_need_extra_args = get_ascend_device_type() == AscendDeviceType.A5
-        # NOTE: When in A2, setting the environment variables HCCL_INTRA_PCIE_ENABLE=1 and
+        # NOTE: When in A2, setting HCCL_INTRA_PCIE_ENABLE=1 and
         # HCCL_INTRA_ROCE_ENABLE=0 can reduce cross-machine communication traffic and significantly
         # improve communication performance.
         # When enable hierarchical communication, param `expert_scales` need to be passed in.
@@ -119,7 +134,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
 
         # Here we need to calculate the global_bs = max_bs_per_rank * ep_world_size to execute
         # dispatch & combine operators with different input num_tokens per rank.
-        vllm_config = get_current_vllm_config()
         scheduler_config = vllm_config.scheduler_config
         compilation_config = vllm_config.compilation_config
         speculative_config = vllm_config.speculative_config
@@ -172,7 +186,13 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             quant_mode = 4 if self.a5_need_extra_args and token_dispatch_input.quant.is_mxfp else 2
         else:
             quant_mode = 0
-        self.moe_expert_num = len(expert_map) + global_redundant_expert_num
+        if self._use_local_tp:
+            total_expert_num = len(expert_map) + global_redundant_expert_num
+            self.moe_expert_num = total_expert_num // self._num_dp_groups
+            dp_offset = self._dp_rank * self.moe_expert_num
+            topk_ids = topk_ids - dp_offset
+        else:
+            self.moe_expert_num = len(expert_map) + global_redundant_expert_num
         kwargs_mc2 = {
             "x": hidden_states,
             "expert_ids": topk_ids,
@@ -259,7 +279,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             group_list=expert_token_nums,
             group_list_type=group_list_type,
             combine_metadata=MoEMC2CombineMetadata(
-                topk_ids=token_dispatch_input.topk_ids,
+                topk_ids=kwargs_mc2["expert_ids"],
                 topk_weights=token_dispatch_input.topk_weights,
                 expert_map=token_dispatch_input.routing.expert_map,
                 ep_recv_counts=ep_recv_counts,
