@@ -121,6 +121,17 @@ class MoECommMethod(ABC):
         self,
         fused_experts_input: MoEFusedExpertsInput,
     ):
+        # TEMP: Skip MoE dispatch for PP testing (export VLLM_ASCEND_SKIP_MOE=1)
+        import os as _os
+        if _os.environ.get("VLLM_ASCEND_SKIP_MOE", "0") == "1":
+            hs = fused_experts_input.hidden_states
+            print(f"[SKIP_MOE] PP testing: skip MoE dispatch+compute, x={hs.shape}", flush=True)
+            return FusedExpertsResult(
+                routed_out=hs,
+                group_list_type=0,
+                expert_tokens=torch.zeros([1], dtype=torch.int64, device=hs.device),
+            )
+
         # Check constraints
         assert fused_experts_input.hidden_states.dtype in [
             torch.float32,
