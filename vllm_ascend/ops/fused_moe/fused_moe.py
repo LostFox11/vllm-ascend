@@ -39,6 +39,7 @@ from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
+from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithMC2
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
@@ -617,7 +618,9 @@ class AscendFusedMoE(FusedMoE):
                 set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
 
         moe_layer_idx = getattr(forward_context, 'moe_layer_index', -1)
+        dispatch_call_id = TokenDispatcherWithMC2._call_counter + 1  # approx ID of next dispatch call
         print(f"[DEBUG_MOE_FORWARD] moe_layer_idx={moe_layer_idx} "
+              f"next_dispatch_call={dispatch_call_id} "
               f"in_profile_run={_EXTRA_CTX.in_profile_run} "
               f"ep_size={self.ep_size} "
               f"local_num_experts={self.local_num_experts} "

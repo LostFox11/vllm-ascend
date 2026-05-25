@@ -88,6 +88,8 @@ class MoETokenDispatcher(ABC, Generic[TMoECombineMetadata]):
 
 
 class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
+    _call_counter = 0
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         device_group = get_mc2_group().device_group
@@ -232,20 +234,32 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self,
         token_dispatch_input: MoETokenDispatchInput,
     ):
+        TokenDispatcherWithMC2._call_counter += 1
+        call_id = TokenDispatcherWithMC2._call_counter
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
         tp_rank = get_tensor_model_parallel_rank()
         x_shape = kwargs_mc2["x"].shape
         eids_shape = kwargs_mc2["expert_ids"].shape
         mask_shape = kwargs_mc2.get("x_active_mask").shape if kwargs_mc2.get("x_active_mask") is not None else None
         scales_shape = kwargs_mc2.get("expert_scales").shape if kwargs_mc2.get("expert_scales") is not None else None
-        print(f"[DEBUG_DISPATCH_INPUT] tp_rank={tp_rank} "
+        # Dump mc2_mask values to verify
+        mask_tensor = kwargs_mc2.get("x_active_mask")
+        mask_min = mask_tensor.to(torch.int8).min().item() if mask_tensor is not None else -1
+        mask_max = mask_tensor.to(torch.int8).max().item() if mask_tensor is not None else -1
+        mask_sum = mask_tensor.to(torch.int32).sum().item() if mask_tensor is not None else -1
+        # expert_ids stats
+        eids_tensor = kwargs_mc2["expert_ids"]
+        eids_min = eids_tensor.min().item()
+        eids_max = eids_tensor.max().item()
+        eids_unique = eids_tensor.unique().numel()
+        print(f"[DEBUG_DISPATCH_INPUT] call_id={call_id} tp_rank={tp_rank} "
               f"x=({x_shape[0]},{x_shape[1]}) "
-              f"expert_ids={eids_shape} "
+              f"expert_ids={eids_shape} eids_min={eids_min} eids_max={eids_max} eids_unique={eids_unique} "
               f"moe_expert_num={kwargs_mc2.get('moe_expert_num')} "
               f"ep_world_size={kwargs_mc2.get('ep_world_size')} "
               f"ep_rank_id={kwargs_mc2.get('ep_rank_id')} "
               f"global_bs={kwargs_mc2.get('global_bs')} "
-              f"x_active_mask={mask_shape} "
+              f"x_active_mask={mask_shape} mask_min={mask_min} mask_max={mask_max} mask_sum={mask_sum} "
               f"expert_scales={scales_shape} "
               f"group_ep={kwargs_mc2.get('group_ep')} "
               f"comm_alg={kwargs_mc2.get('comm_alg')} "
@@ -257,7 +271,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         # Force sync before dispatch to flush any prior errors, so the error
         # below (if any) is definitely from dispatch_v2.
         torch.npu.synchronize()
-        print(f"[DEBUG_DISPATCH] Calling npu_moe_distribute_dispatch_v2...", flush=True)
+        print(f"[DEBUG_DISPATCH] call_id={call_id} Calling npu_moe_distribute_dispatch_v2...", flush=True)
         output = (
             torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
             if self.enable_dispatch_v2
@@ -272,7 +286,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         finally:
             pass
         out_shapes = [o.shape if isinstance(o, torch.Tensor) else type(o).__name__ for o in output[:7]]
-        print(f"[DEBUG_DISPATCH_OUT] sync_ok={_sync_ok} "
+        print(f"[DEBUG_DISPATCH_OUT] call_id={call_id} sync_ok={_sync_ok} "
               f"output_len={len(output)} "
               f"shapes={out_shapes}",
               flush=True)
