@@ -23,6 +23,7 @@
 from abc import ABC, abstractmethod
 from typing import Generic
 
+import os
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
@@ -47,6 +48,11 @@ from vllm_ascend.utils import (
     is_hierarchical_communication_enabled,
     should_skip_allreduce_across_dp_group,
 )
+
+# When set, replaces the MC2 dispatch with a simple per-rank routing (no all-to-all).
+# Each rank only processes its local experts. Non-local expert contributions are dropped.
+# Output shapes are correct; values are wrong. Use only for pipeline testing.
+_SIMPLE_DISPATCH = os.environ.get("VLLM_ASCEND_SIMPLE_DISPATCH", "0") == "1"
 
 
 class MoETokenDispatcher(ABC, Generic[TMoECombineMetadata]):
@@ -234,6 +240,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self,
         token_dispatch_input: MoETokenDispatchInput,
     ):
+        if _SIMPLE_DISPATCH:
+            return self._simple_token_dispatch(token_dispatch_input)
+
         TokenDispatcherWithMC2._call_counter += 1
         call_id = TokenDispatcherWithMC2._call_counter
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
@@ -395,8 +404,71 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         kwargs_mc2.update(stage3_kwargs)
         return kwargs_mc2
 
+    def _simple_token_dispatch(self, token_dispatch_input):
+        """Simple per-rank dispatch using npu_moe_init_routing instead of MC2 all-to-all.
+        Each rank only processes its local experts; non-local contributions are dropped.
+        Output shapes are correct for pipeline testing; values are incomplete.
+        """
+        hs = token_dispatch_input.hidden_states
+        topk_ids = token_dispatch_input.topk_ids
+        topk_weights = token_dispatch_input.topk_weights
+        expert_map = token_dispatch_input.routing.expert_map
+        num_tokens = hs.shape[:-1].numel()
+        topk = token_dispatch_input.topk_ids.shape[-1]
+        num_local = self.moe_expert_num // self.ep_world_size  # 256/16 = 16
+
+        first_expert = self.ep_rank_id * num_local
+        last_expert = first_expert + num_local
+        print(f"[SIMPLE_DISPATCH] x={hs.shape} eids={topk_ids.shape} "
+              f"ep_rank_id={self.ep_rank_id} local_experts=[{first_expert},{last_expert})",
+              flush=True)
+
+        # Apply expert_map: zero out weights for non-local experts
+        if expert_map is not None:
+            mask = expert_map[topk_ids] != -1
+            topk_weights = topk_weights * mask
+
+        sorted_hs, expanded_idx, expert_tokens, dynamic_scale = DeviceOperator.npu_moe_init_routing(
+            hs,
+            topk_ids,
+            scale=None,
+            active_num=num_tokens * topk,
+            expert_num=self.moe_expert_num,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[first_expert, last_expert],
+            quant_mode=-1,
+        )
+
+        print(f"[SIMPLE_DISPATCH_DONE] sorted_hs={sorted_hs.shape} "
+              f"expert_tokens={expert_tokens.shape} local_count={expert_tokens.to(torch.int32).sum().item()}",
+              flush=True)
+
+        return MoETokenDispatchOutput(
+            hidden_states=sorted_hs,
+            dynamic_scale=None,
+            group_list=expert_tokens.to(torch.int64),
+            group_list_type=1,
+            combine_metadata=MoEAllGatherCombineMetadata(
+                topk_weights=topk_weights,
+                expanded_row_idx=expanded_idx,
+                restore_shape=hs.shape,
+            ),
+        )
+
     def token_combine(self, hidden_states, combine_metadata, bias=None):
         assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
+
+        # Handle simple dispatch combine
+        if isinstance(combine_metadata, MoEAllGatherCombineMetadata):
+            final = torch_npu.npu_moe_token_unpermute(
+                permuted_tokens=hidden_states,
+                sorted_indices=torch.abs(combine_metadata.expanded_row_idx),
+                probs=combine_metadata.topk_weights,
+            )
+            if len(combine_metadata.restore_shape) == 3:
+                final = final.view(combine_metadata.restore_shape)
+            return final
 
         kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states, combine_metadata)
         combined_output = (
