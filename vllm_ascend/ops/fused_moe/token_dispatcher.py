@@ -272,17 +272,33 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         # below (if any) is definitely from dispatch_v2.
         torch.npu.synchronize()
         print(f"[DEBUG_DISPATCH] call_id={call_id} Calling npu_moe_distribute_dispatch_v2...", flush=True)
-        output = (
-            torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
-            if self.enable_dispatch_v2
-            else torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)
-        )
+        import traceback
+        try:
+            output = (
+                torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
+                if self.enable_dispatch_v2
+                else torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)
+            )
+        except RuntimeError as e:
+            print(f"[DEBUG_DISPATCH_ERROR] call_id={call_id} "
+                  f"error={e} "
+                  f"x_device={kwargs_mc2['x'].device} "
+                  f"x_dtype={kwargs_mc2['x'].dtype} "
+                  f"x_is_contiguous={kwargs_mc2['x'].is_contiguous()} "
+                  f"eids_device={kwargs_mc2['expert_ids'].device} "
+                  f"eids_dtype={kwargs_mc2['expert_ids'].dtype} "
+                  f"eids_unique_vals={kwargs_mc2['expert_ids'].unique().tolist()}",
+                  flush=True)
+            traceback.print_exc()
+            raise
         # If we reach here, the dispatch call returned without immediate error.
         # The output may still hold deferred errors; force another sync.
         _sync_ok = False
         try:
             torch.npu.synchronize()
             _sync_ok = True
+        except RuntimeError as e:
+            print(f"[DEBUG_DISPATCH_SYNC_ERROR] call_id={call_id} error={e}", flush=True)
         finally:
             pass
         out_shapes = [o.shape if isinstance(o, torch.Tensor) else type(o).__name__ for o in output[:7]]
