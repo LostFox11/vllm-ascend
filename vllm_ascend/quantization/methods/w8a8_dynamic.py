@@ -242,9 +242,24 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         if enable_force_load_balance:
             random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
+            print(f"[DEBUG_W8A8_LB] num_logical_experts={num_logical_experts} "
+                  f"topk_ids_shape={topk_ids.shape} "
+                  f"topk_ids_unique={topk_ids.unique().numel()} "
+                  f"topk_ids_min={topk_ids.min().item()} topk_ids_max={topk_ids.max().item()}",
+                  flush=True)
 
         assert topk_weights is not None
         topk_weights = topk_weights.to(self.in_dtype)
+
+        print(f"[DEBUG_W8A8_MOE] x_shape={x.shape} "
+              f"router_logits_shape={router_logits.shape} "
+              f"topk_weights_shape={topk_weights.shape} "
+              f"topk_ids_shape={topk_ids.shape} "
+              f"mc2_mask={mc2_mask.shape if mc2_mask is not None else None} "
+              f"expert_map={expert_map.shape if expert_map is not None else None} "
+              f"global_redundant={global_redundant_expert_num} "
+              f"enable_force_load_balance={enable_force_load_balance}",
+              flush=True)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         fused_scale_flag = (

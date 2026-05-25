@@ -138,6 +138,19 @@ class MoECommMethod(ABC):
         if fused_experts_input.routing.log2phy is not None:
             routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
 
+        print(f"[DEBUG_FUSED_EXPERTS] hidden_states={fused_experts_input.hidden_states.shape} "
+              f"topk_ids={routed_topk_ids.shape} "
+              f"expert_map={fused_experts_input.routing.expert_map.shape if fused_experts_input.routing.expert_map is not None else None} "
+              f"global_redundant={fused_experts_input.routing.global_redundant_expert_num} "
+              f"mc2_mask={fused_experts_input.routing.mc2_mask.shape if fused_experts_input.routing.mc2_mask is not None else None} "
+              f"log2phy={'yes' if fused_experts_input.routing.log2phy is not None else 'no'}",
+              flush=True)
+        if fused_experts_input.routing.expert_map is not None:
+            n_local = (fused_experts_input.routing.expert_map != -1).sum().item()
+            print(f"[DEBUG_FUSED_EXPERTS_MAP] local_count={n_local} "
+                  f"map_len={len(fused_experts_input.routing.expert_map)}",
+                  flush=True)
+
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
             topk_ids=routed_topk_ids,

@@ -616,6 +616,25 @@ class AscendFusedMoE(FusedMoE):
 
                 set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
 
+        moe_layer_idx = getattr(forward_context, 'moe_layer_index', -1)
+        print(f"[DEBUG_MOE_FORWARD] moe_layer_idx={moe_layer_idx} "
+              f"in_profile_run={_EXTRA_CTX.in_profile_run} "
+              f"ep_size={self.ep_size} "
+              f"local_num_experts={self.local_num_experts} "
+              f"global_num_experts={self.global_num_experts} "
+              f"expert_map_len={len(self._expert_map) if self._expert_map is not None else -1} "
+              f"input_hidden={hidden_states.shape} "
+              f"enable_force_load_balance={enable_force_load_balance} "
+              f"tp_group_size={get_tp_group().world_size} "
+              f"dp_group_size={get_dp_group().world_size}",
+              flush=True)
+        if self._expert_map is not None:
+            n_local = (self._expert_map != -1).sum().item()
+            print(f"[DEBUG_MOE_EXPERT_MAP] local_expert_count={n_local} "
+                  f"global_redundant={self.global_redundant_expert_num} "
+                  f"first_few_globals={self._expert_map[:min(10, len(self._expert_map))].tolist()}",
+                  flush=True)
+
         prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,

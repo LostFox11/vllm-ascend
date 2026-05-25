@@ -253,7 +253,9 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         """
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
+        raw_hidden_shape = hidden_states.shape
         mc2_mask = _EXTRA_CTX.mc2_mask
+        raw_mc2_mask_shape = mc2_mask.shape if mc2_mask is not None else None
         if self.tp_size > 1:
             # Also slice mc2_mask
             split_mc2_mask = torch.tensor_split(mc2_mask, self.tp_size, dim=0)
@@ -277,6 +279,17 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
                 split_router_logits = torch.tensor_split(router_logits, self.tp_size, dim=0)
                 hidden_states = split_hidden_states[self.tp_rank]
                 router_logits = split_router_logits[self.tp_rank]
+
+        print(f"[DEBUG_PREPARE_MC2] tp_rank={self.tp_rank} tp_size={self.tp_size} "
+              f"raw_hidden={raw_hidden_shape} "
+              f"padded_target={_EXTRA_CTX.padded_num_tokens if not self.replace_allreduce else 'N/A'} "
+              f"pad_size={pad_size if not self.replace_allreduce else 0} "
+              f"after_prepare_hidden={hidden_states.shape} "
+              f"raw_mc2_mask={raw_mc2_mask_shape} "
+              f"after_split_mc2_mask={mc2_mask.shape if mc2_mask is not None else None} "
+              f"replace_allreduce={replace_allreduce} "
+              f"enable_shared_expert_dp={enable_shared_expert_dp}",
+              flush=True)
 
         return MoEPrepareOutput(
             hidden_states=hidden_states,

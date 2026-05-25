@@ -26,6 +26,7 @@ from typing import Generic
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.parallel_state import get_ep_group
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -136,6 +137,19 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
                 "PTA and CANN version is too old to support mc2 hierarchy comm, please upgrade your version."
             )
 
+        print(f"[DEBUG_MC2_INIT] tp_size={tp_size}, ep_world_size={self.ep_world_size}, "
+              f"ep_rank_id={self.ep_rank_id}, mc2_group_size={get_mc2_group().world_size}, "
+              f"global_bs={self.global_bs}, max_num_tokens={max_num_tokens}, "
+              f"num_tokens_per_tp_rank={num_tokens_per_tp_rank}, "
+              f"_max_global_bs={_max_global_bs}, "
+              f"need_comm_alg={self.need_comm_alg}, "
+              f"need_expert_scale={self.need_expert_scale}, "
+              f"need_extra_args={self.need_extra_args}, "
+              f"moe_all_to_all_group_name={self.moe_all_to_all_group_name}, "
+              f"enable_dispatch_v2={self.enable_dispatch_v2}, "
+              f"device_group_rank={torch.distributed.get_rank(group=device_group)}",
+              flush=True)
+
     def get_dispatch_mc2_kwargs(
         self,
         token_dispatch_input: MoETokenDispatchInput,
@@ -219,11 +233,49 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         token_dispatch_input: MoETokenDispatchInput,
     ):
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
+        tp_rank = get_tensor_model_parallel_rank()
+        x_shape = kwargs_mc2["x"].shape
+        eids_shape = kwargs_mc2["expert_ids"].shape
+        mask_shape = kwargs_mc2.get("x_active_mask").shape if kwargs_mc2.get("x_active_mask") is not None else None
+        scales_shape = kwargs_mc2.get("expert_scales").shape if kwargs_mc2.get("expert_scales") is not None else None
+        print(f"[DEBUG_DISPATCH_INPUT] tp_rank={tp_rank} "
+              f"x=({x_shape[0]},{x_shape[1]}) "
+              f"expert_ids={eids_shape} "
+              f"moe_expert_num={kwargs_mc2.get('moe_expert_num')} "
+              f"ep_world_size={kwargs_mc2.get('ep_world_size')} "
+              f"ep_rank_id={kwargs_mc2.get('ep_rank_id')} "
+              f"global_bs={kwargs_mc2.get('global_bs')} "
+              f"x_active_mask={mask_shape} "
+              f"expert_scales={scales_shape} "
+              f"group_ep={kwargs_mc2.get('group_ep')} "
+              f"comm_alg={kwargs_mc2.get('comm_alg')} "
+              f"quant_mode={kwargs_mc2.get('quant_mode')} "
+              f"expert_shard_type={kwargs_mc2.get('expert_shard_type')} "
+              f"shared_expert_rank_num={kwargs_mc2.get('shared_expert_rank_num')} "
+              f"expert_token_nums_type={kwargs_mc2.get('expert_token_nums_type')}",
+              flush=True)
+        # Force sync before dispatch to flush any prior errors, so the error
+        # below (if any) is definitely from dispatch_v2.
+        torch.npu.synchronize()
+        print(f"[DEBUG_DISPATCH] Calling npu_moe_distribute_dispatch_v2...", flush=True)
         output = (
             torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
             if self.enable_dispatch_v2
             else torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)
         )
+        # If we reach here, the dispatch call returned without immediate error.
+        # The output may still hold deferred errors; force another sync.
+        _sync_ok = False
+        try:
+            torch.npu.synchronize()
+            _sync_ok = True
+        finally:
+            pass
+        out_shapes = [o.shape if isinstance(o, torch.Tensor) else type(o).__name__ for o in output[:7]]
+        print(f"[DEBUG_DISPATCH_OUT] sync_ok={_sync_ok} "
+              f"output_len={len(output)} "
+              f"shapes={out_shapes}",
+              flush=True)
         # comm_stream.wait_stream(torch.npu.current_stream())
         (
             expand_x,
