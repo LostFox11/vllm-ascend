@@ -1,9 +1,12 @@
+import logging
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import GroupCoordinator, get_tp_group, get_world_group, init_model_parallel_group
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, flashcomm2_enable
+
+logger = logging.getLogger(__name__)
 
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
@@ -37,6 +40,8 @@ def init_ascend_model_parallel(
     backend = torch.distributed.get_backend(get_world_group().device_group)
     global_tp_size = parallel_config.tensor_parallel_size
     global_dp_size = parallel_config.data_parallel_size
+    if parallel_config.data_parallel_external_lb:
+        global_dp_size = parallel_config.data_parallel_size_local
     global_pp_size = parallel_config.pipeline_parallel_size
     global_pcp_size = parallel_config.prefill_context_parallel_size
 
@@ -82,18 +87,34 @@ def init_ascend_model_parallel(
         _P_TP = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name=f"p_tp_{num}")
 
     # EP like group ranks
-    group_ranks = (
-        all_ranks.transpose(1, 2)
-        .reshape(
-            -1,
-            global_dp_size * global_pcp_size * global_tp_size,
+    if parallel_config.data_parallel_external_lb:
+        # TP-local MC2 groups — each group is just the TP ranks within a
+        # single DP process.  This avoids all-to-all across independent DP
+        # groups in data_parallel_external_lb mode.
+        group_ranks = (
+            all_ranks.reshape(-1, global_tp_size)
+            .unbind(0)
         )
-        .unbind(0)
-    )
+    else:
+        group_ranks = (
+            all_ranks.transpose(1, 2)
+            .reshape(
+                -1,
+                global_dp_size * global_pcp_size * global_tp_size,
+            )
+            .unbind(0)
+        )
     group_ranks = [x.tolist() for x in group_ranks]
 
     global _MC2
     _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
+    logger.info(
+        "[rank=%d] MC2 group world_size=%d rank_in_group=%d ranks=%s",
+        get_world_group().rank if get_world_group() else -1,
+        _MC2.world_size,
+        _MC2.rank_in_group,
+        group_ranks,
+    )
 
     if get_ascend_config().eplb_config.dynamic_eplb:
         global _DYNAMIC_EPLB

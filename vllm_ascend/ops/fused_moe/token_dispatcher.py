@@ -20,12 +20,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from abc import ABC, abstractmethod
 from typing import Generic
 
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
+
+logger = logging.getLogger(__name__)
 from vllm.distributed.parallel_state import get_ep_group
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -91,26 +94,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         super().__init__(**kwargs)
         vllm_config = get_current_vllm_config()
 
-        # In data_parallel_external_lb mode, each DP process is independent.
-        # MC2 groups span DP*TP ranks across processes, causing HCCL all-to-all
-        # timeout. Override to use TP-local groups for communication.
-        self._use_local_tp = False
-        self._num_dp_groups = 1
-        self._dp_rank = 0
-        if getattr(vllm_config.parallel_config, 'data_parallel_external_lb', False):
-            from vllm.distributed.parallel_state import get_tp_group
-            tp_group = get_tp_group()
-            device_group = tp_group.device_group
-            self.ep_rank_id = tp_group.rank_in_group
-            self.ep_world_size = tp_group.world_size
-            mc2_group = get_mc2_group()
-            self._num_dp_groups = mc2_group.world_size // tp_group.world_size
-            self._dp_rank = mc2_group.rank_in_group // tp_group.world_size
-            self._use_local_tp = True
-        else:
-            device_group = get_mc2_group().device_group
-            self.ep_rank_id = get_mc2_group().rank_in_group
-            self.ep_world_size = get_mc2_group().world_size
+        device_group = get_mc2_group().device_group
+        self.ep_rank_id = get_mc2_group().rank_in_group
+        self.ep_world_size = get_mc2_group().world_size
 
         backend = device_group._get_backend(torch.device("npu"))
         # Use global rank to avoid HCCL communicator name collisions
@@ -123,6 +109,14 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             # use the group-local rank instead.
             local_rank = torch.distributed.get_rank(group=device_group)
             self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+        logger.info(
+            "[rank=%d] MC2 dispatch: ep_world_size=%d ep_rank_id=%d"
+            " group_name=%s",
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+            self.ep_world_size,
+            self.ep_rank_id,
+            self.moe_all_to_all_group_name,
+        )
         self.enable_dispatch_v2 = hasattr(torch_npu, "npu_moe_distribute_dispatch_v2")
         self.need_extra_args = get_ascend_device_type() in [AscendDeviceType.A3, AscendDeviceType.A5]
         self.a5_need_extra_args = get_ascend_device_type() == AscendDeviceType.A5
@@ -186,21 +180,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             quant_mode = 4 if self.a5_need_extra_args and token_dispatch_input.quant.is_mxfp else 2
         else:
             quant_mode = 0
-        if self._use_local_tp:
-            total_expert_num = len(expert_map) + global_redundant_expert_num
-            self.moe_expert_num = total_expert_num // self._num_dp_groups
-            dp_offset = self._dp_rank * self.moe_expert_num
-            topk_ids = topk_ids - dp_offset
-            # Mask expert IDs outside this DP's range. The router may still
-            # assign tokens to experts on other DP processes. Their weights are
-            # already zeroed by expert_map, but the MC2 operator routes based
-            # on expert_id // experts_per_rank, and with ep_world_size=4
-            # (TP-local), IDs beyond 0..moe_expert_num-1 go to non-existent
-            # ranks.  Setting them to 0 is safe since weight=0 eliminates them.
-            invalid = (topk_ids < 0) | (topk_ids >= self.moe_expert_num)
-            topk_ids = topk_ids.masked_fill(invalid, 0)
-        else:
-            self.moe_expert_num = len(expert_map) + global_redundant_expert_num
+        self.moe_expert_num = len(expert_map) + global_redundant_expert_num
         kwargs_mc2 = {
             "x": hidden_states,
             "expert_ids": topk_ids,
@@ -252,6 +232,26 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             stage1_kwargs.update({"comm_alg": "hierarchy"})
 
         kwargs_mc2.update(stage1_kwargs)
+
+        # Debug: log MC2 dispatch kwargs shape info on first call
+        if not hasattr(self, '_logged_kwargs'):
+            self._logged_kwargs = True
+            logger.info(
+                "[rank=%d] MC2 dispatch kwargs: group_ep=%s ep_world_size=%d ep_rank_id=%d"
+                " moe_expert_num=%d global_bs=%d x_shape=%s expert_ids_shape=%s"
+                " expert_ids_min=%d expert_ids_max=%d",
+                torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                kwargs_mc2.get("group_ep", "N/A"),
+                kwargs_mc2.get("ep_world_size", -1),
+                kwargs_mc2.get("ep_rank_id", -1),
+                kwargs_mc2.get("moe_expert_num", -1),
+                kwargs_mc2.get("global_bs", -1),
+                str(kwargs_mc2["x"].shape),
+                str(kwargs_mc2["expert_ids"].shape),
+                kwargs_mc2["expert_ids"].min().item(),
+                kwargs_mc2["expert_ids"].max().item(),
+            )
+
         return kwargs_mc2
 
     def token_dispatch(
@@ -287,7 +287,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             group_list=expert_token_nums,
             group_list_type=group_list_type,
             combine_metadata=MoEMC2CombineMetadata(
-                topk_ids=kwargs_mc2["expert_ids"],
+                topk_ids=token_dispatch_input.topk_ids,
                 topk_weights=token_dispatch_input.topk_weights,
                 expert_map=token_dispatch_input.routing.expert_map,
                 ep_recv_counts=ep_recv_counts,
