@@ -413,9 +413,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         topk_ids = token_dispatch_input.topk_ids
         topk_weights = token_dispatch_input.topk_weights
         expert_map = token_dispatch_input.routing.expert_map
+        global_redundant = token_dispatch_input.routing.global_redundant_expert_num
         num_tokens = hs.shape[:-1].numel()
         topk = token_dispatch_input.topk_ids.shape[-1]
-        num_local = self.moe_expert_num // self.ep_world_size  # 256/16 = 16
+        num_total_experts = len(expert_map) + global_redundant if expert_map is not None else 256
+        num_local = num_total_experts // self.ep_world_size  # e.g. 256/16 = 16
 
         first_expert = self.ep_rank_id * num_local
         last_expert = first_expert + num_local
@@ -433,7 +435,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             topk_ids,
             scale=None,
             active_num=num_tokens * topk,
-            expert_num=self.moe_expert_num,
+            expert_num=num_total_experts,
             expert_tokens_num_type=1,
             expert_tokens_num_flag=True,
             active_expert_range=[first_expert, last_expert],
