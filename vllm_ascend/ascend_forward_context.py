@@ -1,4 +1,5 @@
 import math
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
@@ -274,10 +275,17 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             moe_comm_type = MoECommType.ALLGATHER
 
     elif soc_version in {AscendDeviceType.A3}:
+        # HACK: force ALLTOALL for testing
+        if os.environ.get("VLLM_ASCEND_FORCE_ALLTOALL", "0") == "1":
+            return MoECommType.ALLTOALL
         # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
         # TODO: drop speculative method guard when dispatch_gmm_combine_decode supports w16a16
         fused_mc2_enable = envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2
         dispatch_ffn_combine_enable = get_ep_group().world_size <= 32
+        print(f"[A3_MOE_SELECT] num_tokens={num_tokens} mc2_tokens_capacity={mc2_tokens_capacity} "
+              f"fused_mc2_enable={fused_mc2_enable} ep_size={get_ep_group().world_size} "
+              f"will_take_mc2={num_tokens <= mc2_tokens_capacity}",
+              flush=True)
         if num_tokens <= mc2_tokens_capacity:
             fused_decode_enable = fused_mc2_enable
             if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
