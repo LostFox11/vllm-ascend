@@ -418,6 +418,15 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
     lies in each device dispatching on the entire sequence, with the hidden state being partitioned.
     """
 
+    # Use MC2 group (per-PP-stage) instead of vLLM EP group (cross-PP-stage)
+    # for correct communication topology when PP is enabled.
+    def _get_comm_group(self):
+        try:
+            mc2 = get_mc2_group()
+            return mc2.device_group, mc2.rank_in_group, mc2.world_size
+        except AssertionError:
+            return get_ep_group().device_group, get_ep_group().rank_in_group, get_ep_group().world_size
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.num_local_experts = kwargs.get("num_local_experts", 0)
@@ -430,7 +439,12 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
                 device=torch.npu.current_device(),
             )
 
-        local_expert_indices_offset = self.ep_rank * self.num_local_experts
+        comm_group, comm_rank, comm_size = self._get_comm_group()
+        self._comm_group = comm_group
+        self._comm_rank_in_group = comm_rank
+        self._comm_world_size = comm_size
+
+        local_expert_indices_offset = self._comm_rank * self.num_local_experts
 
         self.local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
         assert len(self.local_expert_indices) == self.num_local_experts, "Invalid local expert indices"
@@ -440,8 +454,8 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             )
 
         # TODO: Try local_rank = ep_group.rank_in_group
-        local_rank = torch.distributed.get_rank(group=self.ep_group)
-        backend = self.ep_group._get_backend(torch.device("npu"))
+        local_rank = torch.distributed.get_rank(group=self._comm_group)
+        backend = self._comm_group._get_backend(torch.device("npu"))
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
 
     def token_dispatch(
@@ -468,13 +482,13 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         if with_quant:
             permutated_local_input_tokens, dynamic_scale = torch_npu.npu_dynamic_quant(permutated_local_input_tokens)
             _, dynamic_scale_after_all2all, permute2_ep_all_to_all_handle = async_all_to_all(
-                dynamic_scale, output_splits, input_splits, self.ep_group
+                dynamic_scale, output_splits, input_splits, self._comm_group
             )
             permute2_ep_all_to_all_handle.wait()
             dynamic_scale.untyped_storage().resize_(0)
 
         _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
-            permutated_local_input_tokens, output_splits, input_splits, self.ep_group
+            permutated_local_input_tokens, output_splits, input_splits, self._comm_group
         )
         permute1_ep_all_to_all_handle.wait()
         permutated_local_input_tokens.untyped_storage().resize_(0)
@@ -516,7 +530,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             hidden_states,
             combine_metadata.input_splits,
             combine_metadata.output_splits,
-            self.ep_group,
+            self._comm_group,
         )
         handle.wait()
         hidden_states.untyped_storage().resize_(0)
@@ -569,7 +583,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         )
 
         num_global_tokens_per_expert = gather_from_sequence_parallel_region(
-            num_local_tokens_per_expert, group=self.ep_group
+            num_local_tokens_per_expert, group=self._comm_group
         ).reshape(ep_size, self.num_experts)
         num_global_tokens_per_local_expert = num_global_tokens_per_expert[
             :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
