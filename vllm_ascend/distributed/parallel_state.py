@@ -95,6 +95,20 @@ def init_ascend_model_parallel(
     global _MC2
     _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
 
+    # Verify MC2 group communicator works with a simple barrier
+    device_group = _MC2.device_group
+    world_rank = torch.distributed.get_rank()
+    mc2_rank_in_group = _MC2.rank_in_group
+    mc2_world_size = _MC2.world_size
+    print(f"[MC2_GROUP_INIT] world_rank={world_rank} mc2_rank={mc2_rank_in_group} mc2_size={mc2_world_size} "
+          f"group_ranks={_MC2.ranks}", flush=True)
+    try:
+        torch.distributed.barrier(group=device_group)
+        print(f"[MC2_GROUP_INIT] world_rank={world_rank} barrier SUCCEEDED", flush=True)
+    except Exception as e:
+        print(f"[MC2_GROUP_INIT] world_rank={world_rank} barrier FAILED: {e}", flush=True)
+        raise
+
     if get_ascend_config().eplb_config.dynamic_eplb:
         global _DYNAMIC_EPLB
         _DYNAMIC_EPLB = init_model_parallel_group(
