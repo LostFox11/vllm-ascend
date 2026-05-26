@@ -903,7 +903,10 @@ class RecomputeScheduler(Scheduler):
             routed_experts = None
             finish_reason = None
             if stopped:
-                routed_experts = self._get_routed_experts(request)
+                # FIXME: upstream base scheduler refactored routed_expert retrieval into
+                # a separate method _get_routed_experts, but AsyncRecomputeScheduler does
+                # not override it. Keep as None until the proper integration is done.
+                pass
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
