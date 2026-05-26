@@ -25,10 +25,11 @@ from typing import Generic
 
 import os
 import torch
+import torch.distributed as dist
 import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank
-from vllm.distributed.parallel_state import get_ep_group
+from vllm.distributed.parallel_state import get_ep_group, get_world_group
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.device_op import DeviceOperator
@@ -279,6 +280,13 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
               flush=True)
         # Force sync before dispatch to flush any prior errors, so the error
         # below (if any) is definitely from dispatch_v2.
+        torch.npu.synchronize()
+
+        # WORLD-GROUP BARRIER to serialize MC2 ops across PP stages.
+        # PP stages run concurrently during profile_run, causing two MC2 groups
+        # (16 HCCL comms each) to do all-to-all simultaneously on the same 32 NPUs.
+        # This barrier serializes them to test if that causes the aicore crash.
+        torch.distributed.barrier(group=get_world_group().device_group)
         torch.npu.synchronize()
         print(f"[DEBUG_DISPATCH] call_id={call_id} Calling npu_moe_distribute_dispatch_v2...", flush=True)
         import traceback
