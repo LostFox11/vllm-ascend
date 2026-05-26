@@ -444,7 +444,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         self._comm_rank_in_group = comm_rank
         self._comm_world_size = comm_size
 
-        local_expert_indices_offset = self._comm_rank * self.num_local_experts
+        local_expert_indices_offset = self._comm_rank_in_group * self.num_local_experts
 
         self.local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
         assert len(self.local_expert_indices) == self.num_local_experts, "Invalid local expert indices"
