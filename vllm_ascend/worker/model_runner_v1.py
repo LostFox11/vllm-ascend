@@ -1293,6 +1293,15 @@ class NPUModelRunner(GPUModelRunner):
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
         if self.pcp_size > 1:
             logits_indices = logits_indices_pcp
+        # [DBG] 只在 last PP rank 打印 draft token 信息
+        _pp_rank = get_pp_group().rank_in_group if get_pp_group().world_size > 1 else 0
+        if get_pp_group().is_last_rank and hasattr(self, "input_batch"):
+            _num_reqs = self.input_batch.num_reqs
+            print(f"[DBG_RS] rank={_pp_rank} num_draft_tokens={num_draft_tokens.tolist()} "
+                  f"draft_ids={draft_token_ids.cpu().tolist()} "
+                  f"logits_idx_0={logits_indices[0].item() if logits_indices.numel()>0 else -1} "
+                  f"total_logits={logits_indices.numel()} "
+                  f"cu_scheduled={cu_num_scheduled_tokens.tolist()}")
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
@@ -1893,6 +1902,12 @@ class NPUModelRunner(GPUModelRunner):
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs and get_pp_group().is_last_rank:
+                if isinstance(hidden_states, tuple):
+                    _hs0_shape = hidden_states[0].shape if len(hidden_states) > 0 else "N/A"
+                    _aux_len = len(hidden_states[1]) if len(hidden_states) > 1 else 0
+                    print(f"[DBG_RS] rank={get_pp_group().rank_in_group} UNPACK_TUPLE "
+                          f"hs_shape={list(_hs0_shape)} aux_list_len={_aux_len} "
+                          f"flash_comm={getattr(get_forward_context(), 'flash_comm_v1_enabled', 'N/A')}")
                 hidden_states, aux_hidden_states = hidden_states
             if self.pcp_size > 1:
                 # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
@@ -2192,12 +2207,40 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
+
+        # [DBG] 在 rejection sampler 前打印 draft vs target argmax
+        _pp_rank_rs = get_pp_group().rank_in_group if get_pp_group().world_size > 1 else 0
+        _draft_ids = spec_decode_metadata.draft_token_ids
+        _tgt_indices = spec_decode_metadata.target_logits_indices
+        if logits is not None and _tgt_indices.numel() > 0:
+            # target_logits 是 logits 中 draft 验证位置的行
+            _tgt_logits = logits[_tgt_indices]
+            _tgt_argmax = _tgt_logits.argmax(dim=-1)
+            _match = (_draft_ids == _tgt_argmax)
+            _match_rate = _match.float().mean().item()
+            if _match_rate > 0.5 or _draft_ids.numel() <= 10:
+                print(f"[DBG_RS] rank={_pp_rank_rs} BEFORE_REJECTION "
+                      f"draft_ids={_draft_ids.cpu().tolist()} "
+                      f"tgt_argmax={_tgt_argmax.cpu().tolist()} "
+                      f"match={_match.cpu().tolist()} "
+                      f"rate={_match_rate:.3f} "
+                      f"num_draft={spec_decode_metadata.num_draft_tokens}")
+
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             None,  # draft_probs
             logits,
             sampling_metadata,
         )
+
+        # [DBG] rejection sampler 输出 — 看有多少 token 被接受
+        if _draft_ids.numel() <= 10:
+            _out_ids = sampler_output.sampled_token_ids
+            _valid = (_out_ids >= 0)
+            print(f"[DBG_RS] rank={_pp_rank_rs} AFTER_REJECTION "
+                  f"output_shape={list(_out_ids.shape)} "
+                  f"first_req={_out_ids[0].cpu().tolist() if _out_ids.shape[0] > 0 else []} "
+                  f"valid_total={_valid.sum().item()}")
         return sampler_output
 
     # TODO: remove this func after eagle_proposer is refactored and
@@ -2410,7 +2453,22 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
+            _before = hidden_states
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
+            # [DBG] 检查 all-gather 是否改变了 hidden_states 维度
+            if isinstance(hidden_states, tuple):
+                _after_shape = hidden_states[0].shape
+            elif isinstance(hidden_states, torch.Tensor):
+                _after_shape = hidden_states.shape
+            else:
+                _after_shape = "???"
+            if isinstance(_before, tuple):
+                _before_shape = _before[0].shape
+            else:
+                _before_shape = _before.shape
+            print(f"[DBG_RS] ALLGATHER rank={get_pp_group().rank_in_group} "
+                  f"before={list(_before_shape)} after={list(_after_shape)} "
+                  f"pad_size={getattr(forward_context, 'pad_size', -1)}")
         return hidden_states
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
