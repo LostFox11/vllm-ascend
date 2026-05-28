@@ -1385,7 +1385,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
             )
             self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
-        elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
+        elif get_pp_group().is_last_rank and (self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()):
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 
@@ -1508,6 +1508,7 @@ class NPUModelRunner(GPUModelRunner):
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
+        # logger.info(f"===================draft_token_ids:{draft_token_ids}")
         return draft_token_ids
 
     @torch.inference_mode()
@@ -1851,7 +1852,8 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
-
+            for i in range(len(logits)):
+                # logger.info(f"================idx {i} logits {logits.shape} {logits[i].to(torch.float).norm(p=1)}")
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
                 scheduler_output,
@@ -1890,6 +1892,9 @@ class NPUModelRunner(GPUModelRunner):
             # (e.g., PCP input preparation) can access them.
             if self.use_async_scheduling and get_pp_group().world_size > 1:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
+                if self.speculative_config is not None and self.num_spec_tokens > 0:
+                    self._pp_receive_valid_sampled_token_count()
+                    self._pp_receive_draft_token_ids()
             if not kv_connector_output:
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
@@ -1931,6 +1936,7 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+            # logger.info(f"===================sampler_output:{sampler_output}")
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -1939,6 +1945,37 @@ class NPUModelRunner(GPUModelRunner):
             assert self.sampling_done_event is not None
             self.sampling_done_event.record()
 
+            with (
+                record_function_or_nullcontext("async_state_update"),
+                torch.npu.stream(global_stream()),
+            ):
+                global_stream().wait_event(self.sampling_done_event)
+                self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+        else:
+            self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+
+        # 3. PP 广播计算状态初始化
+        need_pp_prev_sampled_broadcast = False
+        did_pp_prev_sampled_broadcast = False
+        if self.use_async_scheduling:
+            pp = get_pp_group()
+            # 如果不是 broadcast_pp_output 模式，且属于多级PP的最后一级，则需要广播
+            need_pp_prev_sampled_broadcast = (
+                not getattr(self, "broadcast_pp_output", False) and pp.world_size > 1 and pp.is_last_rank
+            )
+            # 如果不是投机采样（shape[-1] == 1），优先将采样到的 token_id 广播出去
+            if (
+                need_pp_prev_sampled_broadcast
+                and sampler_output.sampled_token_ids.shape[-1] == 1
+            ):
+                self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
+                did_pp_prev_sampled_broadcast = True
+        
+        # 4. 重置/清理 NPU 端临时投机变量状态
+        self._draft_token_ids = None
+        if hasattr(self, "_draft_token_req_ids"):
+            self._draft_token_req_ids = None
+        
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None # type: ignore[no-redef]
 
         def propose_draft_token_ids(sampled_token_ids):
@@ -1979,6 +2016,7 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config:
                 use_padded_batch = (
                     self.speculative_config
+                    and get_pp_group().is_last_rank
                     and (
                         self.speculative_config.use_eagle()
                         or self.speculative_config.uses_draft_model()
@@ -2008,6 +2046,39 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 logger.warning("RoutedExpertsCapturer is not initialized.")
 
+        # ================= Speculative PP 状态广播 =================
+        if need_pp_prev_sampled_broadcast and not did_pp_prev_sampled_broadcast:
+            # 投机采样模式下，sampled_token_ids 可能是多维的。广播早先准备好的已缩减的 prev_sampled_token_ids
+            prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
+            assert prev_sampled_token_ids is not None, (
+                "PP+async expects prev_sampled_token_ids before broadcast"
+            )
+            self._pp_broadcast_prev_sampled_token_ids(prev_sampled_token_ids)
+
+        if (
+            need_pp_prev_sampled_broadcast
+            and self.speculative_config is not None
+            and self.num_spec_tokens > 0
+        ):
+            # 1. 广播有效的 token 计数
+            valid_sampled_token_count = self._get_valid_sampled_token_count_tensor(
+                sampler_output.sampled_token_ids
+            )
+            self._pp_broadcast_valid_sampled_token_count(valid_sampled_token_count)
+
+            # 2. 广播 Draft token ids
+            draft_token_ids = self._get_padded_draft_token_ids(
+                len(self.input_batch.req_ids)
+            )
+            if draft_token_ids is None:
+                draft_token_ids = torch.zeros(
+                    (len(self.input_batch.req_ids), self.num_spec_tokens),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            self._pp_broadcast_draft_token_ids(draft_token_ids)
+        # ========================================================
+
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2030,23 +2101,6 @@ class NPUModelRunner(GPUModelRunner):
         if self.debugger is not None:
             self.debugger.stop()
             self.debugger.step()
-
-        if self.need_accepted_tokens:
-            assert self.sampling_done_event is not None
-            with (
-                record_function_or_nullcontext("async_state_update"),
-                torch.npu.stream(global_stream()),
-            ):
-                global_stream().wait_event(self.sampling_done_event)
-                self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
-
-        # In async scheduling + PP, broadcast sampled token ids from the
-        # last PP rank so other PP ranks can receive them without going
-        # through the scheduler/engine IPC path.
-        if self.use_async_scheduling:
-            pp = get_pp_group()
-            if pp.world_size > 1 and pp.is_last_rank:
-                self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
         if not self.use_async_scheduling:
             return model_runner_output
@@ -2085,6 +2139,7 @@ class NPUModelRunner(GPUModelRunner):
             logits,
             sampling_metadata,
         )
+        # logger.info(f"===================reject sampler_output:{sampler_output}")
         return sampler_output
 
     # TODO: remove this func after eagle_proposer is refactored and
@@ -2271,6 +2326,7 @@ class NPUModelRunner(GPUModelRunner):
         inputs_embeds: torch.Tensor | None = None,
         **model_kwargs: dict[str, Any],
     ):
+        # logger.info(f"===================input_ids:{input_ids}")
         assert self.model is not None
         forward_context = get_forward_context()
         assert forward_context is not None
@@ -2654,7 +2710,11 @@ class NPUModelRunner(GPUModelRunner):
 
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(kv_cache_gid)
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and spec_decode_common_attn_metadata is None
+            ):
                 if isinstance(
                     self.drafter,
                     AscendEagleProposer
@@ -3090,15 +3150,20 @@ class NPUModelRunner(GPUModelRunner):
         self.use_hybrid_blocks = len(self.attn_groups) > 1
         # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
         self.need_accepted_tokens = any(
-            [isinstance(attn_group[0].kv_cache_spec, MambaSpec) for attn_group in self.attn_groups]
+            [isinstance(attn_group[0].kv_cache_spec, MambaSpec) for attn_group in self.attn_groups if attn_group]
         )
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
-        if self.speculative_config and (
-            self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
+        if (
+            self.speculative_config 
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle() 
+                or self.speculative_config.uses_draft_model()
+            )
         ):
             assert isinstance(
                 self.drafter,

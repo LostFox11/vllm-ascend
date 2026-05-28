@@ -198,8 +198,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         with set_model_tag("eagle_head"):
             model = get_model(
-                vllm_config=self.vllm_config,
-                model_config=self.vllm_config.speculative_config.draft_model_config,
+                vllm_config=self.draft_vllm_config,
+                model_config=self.draft_vllm_config.speculative_config.draft_model_config,
             )
         return model
 
@@ -211,14 +211,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # Find draft layers (attention layers added by draft model)
         all_attn_layers = get_layers_from_vllm_config(
-            self.vllm_config,
+            self.draft_vllm_config,
             AttentionLayerBase,  # type: ignore[type-abstract]
         )
-        all_indexer_layer_names = set(get_layers_from_vllm_config(self.vllm_config, DeepseekV32IndexerCache).keys())
+        all_indexer_layer_names = set(get_layers_from_vllm_config(self.draft_vllm_config, DeepseekV32IndexerCache).keys())
         self._draft_attn_layer_names = set(all_attn_layers.keys()) - target_attn_layer_names - all_indexer_layer_names
 
         self.attn_layer_names = list(sorted(self._draft_attn_layer_names))
-        draft_attn_layers_dict = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+        draft_attn_layers_dict = get_layers_from_vllm_config(self.draft_vllm_config, AttentionLayerBase)
         self.kernel_block_size = (
             draft_attn_layers_dict[self.attn_layer_names[0]].get_attn_backend().get_supported_kernel_block_sizes()[0]
         )
@@ -342,12 +342,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
                     layer_module.shared_head.head = model.lm_head
 
-        if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
+        if self.draft_vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             self.update_stream = torch.npu.Stream()
             if self.method == "dflash":
                 self.model = ACLGraphWrapper(
                     self.model,
-                    self.vllm_config,
+                    self.draft_vllm_config,
                     runtime_mode=CUDAGraphMode.FULL,
                     use_eagle=self.use_eagle,
                     enable_enpu=self.enable_enpu,
@@ -355,7 +355,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             else:
                 self._runnable = ACLGraphWrapper(
                     self._run_merged_draft,
-                    self.vllm_config,
+                    self.draft_vllm_config,
                     runtime_mode=CUDAGraphMode.FULL,
                     use_eagle=self.use_eagle,
                     enable_enpu=self.enable_enpu,
@@ -486,7 +486,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,
-            self.vllm_config,
+            self.draft_vllm_config,
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_actual_tokens=0,
@@ -812,7 +812,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0],
-            self.vllm_config,
+            self.draft_vllm_config,
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_actual_tokens=num_tokens,
@@ -2078,7 +2078,7 @@ class MultiLayerEagleProposer(AscendSpecDecodeBaseProposer):
 
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,
-            self.vllm_config,
+            self.draft_vllm_config,
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_actual_tokens=0,
@@ -2422,7 +2422,7 @@ class MultiLayerEagleProposer(AscendSpecDecodeBaseProposer):
         with set_ascend_forward_context(
             # multi_steps_attn_metadata[0],
             per_layer_attn_metadata,
-            self.vllm_config,
+            self.draft_vllm_config,
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_actual_tokens=num_tokens,
@@ -2543,6 +2543,7 @@ class MultiLayerEagleProposer(AscendSpecDecodeBaseProposer):
                 logits = self.model.compute_logits(
                     sample_hidden_states, spec_step_idx=spec_step_idx
                 )
+                # logger.info(f"================spec_step_idx {spec_step_idx} logits {logits.shape} {logits.to(torch.float).norm(p=1)}")
             else:
                 logits = self.model.compute_logits(sample_hidden_states)
 
