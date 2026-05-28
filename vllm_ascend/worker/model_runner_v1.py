@@ -1852,7 +1852,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
-            for i in range(len(logits)):
+            # for i in range(len(logits)):
                 # logger.info(f"================idx {i} logits {logits.shape} {logits[i].to(torch.float).norm(p=1)}")
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
@@ -1954,16 +1954,12 @@ class NPUModelRunner(GPUModelRunner):
         else:
             self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
-        # 3. PP 广播计算状态初始化
         need_pp_prev_sampled_broadcast = False
         did_pp_prev_sampled_broadcast = False
         if self.use_async_scheduling:
-            pp = get_pp_group()
-            # 如果不是 broadcast_pp_output 模式，且属于多级PP的最后一级，则需要广播
             need_pp_prev_sampled_broadcast = (
-                not getattr(self, "broadcast_pp_output", False) and pp.world_size > 1 and pp.is_last_rank
+                not getattr(self, "broadcast_pp_output", False) and get_pp_group().world_size > 1 and get_pp_group().is_last_rank
             )
-            # 如果不是投机采样（shape[-1] == 1），优先将采样到的 token_id 广播出去
             if (
                 need_pp_prev_sampled_broadcast
                 and sampler_output.sampled_token_ids.shape[-1] == 1
@@ -1971,7 +1967,6 @@ class NPUModelRunner(GPUModelRunner):
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
                 did_pp_prev_sampled_broadcast = True
         
-        # 4. 重置/清理 NPU 端临时投机变量状态
         self._draft_token_ids = None
         if hasattr(self, "_draft_token_req_ids"):
             self._draft_token_req_ids = None
@@ -2046,9 +2041,7 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 logger.warning("RoutedExpertsCapturer is not initialized.")
 
-        # ================= Speculative PP 状态广播 =================
         if need_pp_prev_sampled_broadcast and not did_pp_prev_sampled_broadcast:
-            # 投机采样模式下，sampled_token_ids 可能是多维的。广播早先准备好的已缩减的 prev_sampled_token_ids
             prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
             assert prev_sampled_token_ids is not None, (
                 "PP+async expects prev_sampled_token_ids before broadcast"
@@ -2060,13 +2053,12 @@ class NPUModelRunner(GPUModelRunner):
             and self.speculative_config is not None
             and self.num_spec_tokens > 0
         ):
-            # 1. 广播有效的 token 计数
+
             valid_sampled_token_count = self._get_valid_sampled_token_count_tensor(
                 sampler_output.sampled_token_ids
             )
             self._pp_broadcast_valid_sampled_token_count(valid_sampled_token_count)
 
-            # 2. 广播 Draft token ids
             draft_token_ids = self._get_padded_draft_token_ids(
                 len(self.input_batch.req_ids)
             )
@@ -2077,7 +2069,6 @@ class NPUModelRunner(GPUModelRunner):
                     device=self.device,
                 )
             self._pp_broadcast_draft_token_ids(draft_token_ids)
-        # ========================================================
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
@@ -3969,6 +3960,20 @@ class NPUModelRunner(GPUModelRunner):
                     tensor = mm_data[field]
                     if isinstance(tensor, torch.Tensor) and tensor.device.type != "cpu":
                         mm_data[field] = tensor.cpu()
+
+    def _pp_receive_valid_sampled_token_count(self) -> None:
+        assert not get_pp_group().is_last_rank
+        recv = torch.empty(
+            (self.input_batch.num_reqs,), dtype=torch.int32, device=self.device
+        )
+        torch.distributed.broadcast(recv, src=get_pp_group().last_rank, group=get_pp_group().device_group)
+        
+        # Standard vLLM sets the CPU counterpart
+        self._pp_valid_sampled_token_count = recv.cpu()
+        
+        # FIX: Ascend also needs to retain the GPU tensor so _prepare_inputs can correct the KV cache!
+        if self.use_async_spec_decode:
+            self.valid_sampled_token_count_gpu = recv
 
 
 def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
