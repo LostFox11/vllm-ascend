@@ -166,37 +166,37 @@ def _patch_proposer_load_model():
             # Last PP rank or PP=1: full load_model.
             _original_load_model(self, model)
 
-        # [FIX] PP > 1: broadcast embed_tokens from rank 0 to last rank.
+        # [FIX] PP > 1: send embed_tokens from rank 0 to last rank (per TP shard).
         # PP 下 _maybe_share_embeddings 被跳过, 但 Eagle3 checkpoint 通常不带
         # 独立 embed_tokens 权重, drafter 的 embed_tokens 随机初始化.
         # autoregressive 的 2nd/3rd draft token 用随机 embedding → 低质量预测.
+        # 用 send/recv 而不是 broadcast, 因为每个 TP rank 的 shard 不同,
+        # broadcast 会把同一个 shard 发给所有 rank 导致 TP shard 错乱.
         if pp_group.world_size > 1:
+            # PP group has 2 members per TP rank: [PP0_TPk, PP1_TPk]
+            # pp_group.ranks[0] = PP0's global rank for this TP rank
+            # pp_group.ranks[1] = PP1's global rank for this TP rank
             if pp_group.is_first_rank:
-                # Rank 0: target model 有真实 embed_tokens → send
+                # PP0: send my embed_tokens shard to PP1
                 if (hasattr(model.model, "embed_tokens")
                         and hasattr(model.model.embed_tokens, "weight")):
-                    torch.distributed.broadcast(
-                        model.model.embed_tokens.weight.data,
-                        src=pp_group.ranks[0],
+                    torch.distributed.send(
+                        model.model.embed_tokens.weight.data.contiguous(),
+                        dst=pp_group.ranks[1],
                         group=pp_group.device_group,
                     )
-            else:
-                # Non-first rank: 参与 broadcast, 接收 embed_tokens
-                _dst = None
+            elif pp_group.is_last_rank:
+                # PP1: receive my shard from PP0
                 if (hasattr(self, "model") and hasattr(self.model, "model")
                         and hasattr(self.model.model, "embed_tokens")
                         and hasattr(self.model.model.embed_tokens, "weight")):
-                    _dst = self.model.model.embed_tokens.weight.data
-                if _dst is not None:
-                    torch.distributed.broadcast(
-                        _dst,
+                    torch.distributed.recv(
+                        self.model.model.embed_tokens.weight.data,
                         src=pp_group.ranks[0],
                         group=pp_group.device_group,
                     )
-                    if pp_group.is_last_rank:
-                        logger.info(
-                            "PP broadcast embed_tokens to drafter (shape=%s)",
-                            list(_dst.shape))
+                    logger.info("PP recv embed_tokens for drafter (shape=%s)",
+                                list(self.model.model.embed_tokens.weight.data.shape))
 
     AscendEagleProposer.load_model = _patched_load_model
 
