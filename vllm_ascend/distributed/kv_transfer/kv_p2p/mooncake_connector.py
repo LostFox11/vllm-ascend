@@ -1127,7 +1127,7 @@ class MooncakeConnectorWorker:
 
         self.max_device_id = self.tp_size * self.dp_size * self.pcp_size * self.pp_size
         self.kv_role = vllm_config.kv_transfer_config.kv_role
-        self.num_key_value_heads = self.vllm_config.model_config.hf_text_config.num_key_value_heads
+        self.num_key_value_heads = self.vllm_config.model_config.get_total_num_kv_heads()
 
         # Handshake base port
         self.side_channel_port = (

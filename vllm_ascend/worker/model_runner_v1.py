@@ -1905,13 +1905,13 @@ class NPUModelRunner(GPUModelRunner):
             if self.use_async_scheduling and get_pp_group().world_size > 1:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
                 if self.speculative_config is not None and self.num_spec_tokens > 0:
-                    if self._is_all_reqs_chunked_prefill():
-                        # All requests are chunked prefill: the last rank skips
-                        # the matching broadcasts (the spec state is dummy and
-                        # never consumed). Skip the receives symmetrically and
-                        # clear stale spec state so the next step's
-                        # _prepare_inputs does not apply a spec KV correction
-                        # with a tensor from a previous step.
+                    if self._pp_skip_sampled_token_broadcast():
+                        # The spec state is dummy / never consumed (all chunked
+                        # prefill, or a prefill kv_producer node). The last rank
+                        # skips the matching broadcasts, so skip the receives
+                        # symmetrically and clear stale spec state so the next
+                        # step's _prepare_inputs does not apply a spec KV
+                        # correction with a tensor from a previous step.
                         self._pp_valid_sampled_token_count = None
                         self._draft_token_ids = None
                         self.valid_sampled_token_count_gpu = None
@@ -2076,11 +2076,11 @@ class NPUModelRunner(GPUModelRunner):
             and self.speculative_config is not None
             and self.num_spec_tokens > 0
         ):
-            if not self._is_all_reqs_chunked_prefill():
-                # When all requests are chunked prefill the counts/draft are
-                # dummy and discarded on every rank, so the collective is
-                # skipped. The non-last ranks skip the matching receives via the
-                # same condition (keeping the broadcast symmetric).
+            if not self._pp_skip_sampled_token_broadcast():
+                # Skip the collective when the counts/draft are dummy / never
+                # consumed (all chunked prefill, or a prefill kv_producer node).
+                # The non-last ranks skip the matching receives via the same
+                # condition (keeping the broadcast symmetric).
                 valid_sampled_token_count = self._get_valid_sampled_token_count_tensor(
                     sampler_output.sampled_token_ids
                 )
@@ -3987,6 +3987,48 @@ class NPUModelRunner(GPUModelRunner):
                     tensor = mm_data[field]
                     if isinstance(tensor, torch.Tensor) and tensor.device.type != "cpu":
                         mm_data[field] = tensor.cpu()
+
+    def _pp_skip_sampled_token_broadcast(self) -> bool:
+        """Whether the PP sampled-token / spec-state collectives can be skipped.
+
+        The ``prev_sampled_token_ids`` / ``valid_sampled_token_count`` /
+        ``draft_token_ids`` collectives only feed the next decode step's input
+        preparation on non-last PP ranks. They can be skipped when that data is
+        never consumed:
+
+        - All scheduled requests are non-final chunked-prefill chunks (their
+          sampled/draft tokens are discarded), or
+        - This is a Prefill (``kv_producer``) node in PD disaggregation: it only
+          runs prefill chunks (inputs come from the prompt) and hands the
+          request off after the first token, so no request ever continues into a
+          decode step that would consume ``prev_sampled_token_ids``.
+
+        Both conditions are identical on every PP rank for the same step, so the
+        broadcast (last rank) and receive (other ranks) stay symmetric.
+        """
+        return self.is_kv_producer or self._is_all_reqs_chunked_prefill()
+
+    def _pp_broadcast_prev_sampled_token_ids(
+        self, sampled_token_ids: torch.Tensor
+    ) -> None:
+        # Prefill (kv_producer) node never runs a decode step, so non-last ranks
+        # never consume the broadcast sampled tokens. Skip the collective (the
+        # non-last ranks skip the matching receive via is_kv_producer). The base
+        # implementation still handles the all-chunked-prefill skip.
+        if self.is_kv_producer:
+            return
+        super()._pp_broadcast_prev_sampled_token_ids(sampled_token_ids)
+
+    def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
+        if self.is_kv_producer:
+            # Symmetric with the last rank's skipped broadcast. Prefill requests
+            # read input_ids from the prompt, so force the normal (non-async)
+            # input path and avoid building a prev mapping that would index into
+            # a non-broadcast tensor.
+            self.input_batch.prev_sampled_token_ids = None
+            self.input_batch.prev_req_id_to_index = {}
+            return
+        super()._pp_receive_prev_sampled_token_ids_to_input_batch()
 
     def _pp_receive_valid_sampled_token_count(self) -> None:
         assert not get_pp_group().is_last_rank
