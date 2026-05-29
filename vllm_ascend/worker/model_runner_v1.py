@@ -3275,6 +3275,36 @@ class NPUModelRunner(GPUModelRunner):
                 with get_tp_context(self.drafter):
                     self.drafter.load_model(self.model)
 
+            # [FIX] PP > 1: broadcast embed_tokens from PP rank 0 to all PP ranks.
+            # _maybe_share_embeddings 在 PP > 1 时跳过, 但 Eagle3 checkpoint 中
+            # 通常没有独立 embed_tokens, 导致 drafter 的 embed_tokens 随机初始化.
+            # 注意: src=0 是 within-group rank, 不是全局 rank.
+            # 这段代码在 load_model() 中, 所有 PP rank 都会执行.
+            if (self.vllm_config.parallel_config.pipeline_parallel_size > 1
+                    and self.speculative_config
+                    and self.speculative_config.method == "eagle3"):
+                _pp = get_pp_group()
+                if _pp.is_first_rank:
+                    # PP rank 0: 发送 target model 的 embed_tokens
+                    if hasattr(self.model.model, "embed_tokens") and hasattr(
+                            self.model.model.embed_tokens, "weight"):
+                        torch.distributed.broadcast(
+                            self.model.model.embed_tokens.weight.data,
+                            src=0, group=_pp.device_group,
+                        )
+                else:
+                    # 非 first rank: 接收 broadcast
+                    _tgt = None
+                    if self.drafter is not None:
+                        _tgt = self.drafter.model.model.embed_tokens.weight.data
+                    if _tgt is not None:
+                        torch.distributed.broadcast(
+                            _tgt, src=0, group=_pp.device_group,
+                        )
+                        if _pp.is_last_rank:
+                            logger.info("PP broadcast embed_tokens to drafter (shape=%s)",
+                                        list(_tgt.shape))
+
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_memory

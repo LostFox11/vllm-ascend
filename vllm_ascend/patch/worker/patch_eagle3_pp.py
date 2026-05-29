@@ -22,15 +22,12 @@
 import torch
 import torch.nn as nn
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.logger import init_logger
 from vllm.model_executor.models.llama_eagle3 import (
     Eagle3LlamaForCausalLM,
     LlamaModel,
 )
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.sequence import IntermediateTensors
-
-logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Stub helpers for non-last PP ranks
@@ -151,9 +148,7 @@ def _patch_proposer_load_model():
     _original_load_model = AscendEagleProposer.load_model
 
     def _patched_load_model(self, model: nn.Module) -> None:
-        pp_group = get_pp_group()
-
-        if pp_group.world_size > 1 and not pp_group.is_last_rank:
+        if get_pp_group().world_size > 1 and not get_pp_group().is_last_rank:
             # Non-last PP rank: only create the draft model stub, skip
             # attention-layer discovery, kernel config, and weight sharing.
             with self.maybe_eager_context:
@@ -161,42 +156,10 @@ def _patch_proposer_load_model():
             self._draft_attn_layer_names = set()
             self.attn_layer_names = []
             self.piece_all_attn_layer_name = []
-            # 不 return——下面的 broadcast 需要所有 rank 参与
-        else:
-            # Last PP rank or PP=1: full load_model.
-            _original_load_model(self, model)
+            return
 
-        # [FIX] PP > 1: send embed_tokens from rank 0 to last rank (per TP shard).
-        # PP 下 _maybe_share_embeddings 被跳过, 但 Eagle3 checkpoint 通常不带
-        # 独立 embed_tokens 权重, drafter 的 embed_tokens 随机初始化.
-        # autoregressive 的 2nd/3rd draft token 用随机 embedding → 低质量预测.
-        # 用 send/recv 而不是 broadcast, 因为每个 TP rank 的 shard 不同,
-        # broadcast 会把同一个 shard 发给所有 rank 导致 TP shard 错乱.
-        if pp_group.world_size > 1:
-            # PP group has 2 members per TP rank: [PP0_TPk, PP1_TPk]
-            # pp_group.ranks[0] = PP0's global rank for this TP rank
-            # pp_group.ranks[1] = PP1's global rank for this TP rank
-            if pp_group.is_first_rank:
-                # PP0: send my embed_tokens shard to PP1
-                if (hasattr(model.model, "embed_tokens")
-                        and hasattr(model.model.embed_tokens, "weight")):
-                    torch.distributed.send(
-                        model.model.embed_tokens.weight.data.contiguous(),
-                        dst=pp_group.ranks[1],
-                        group=pp_group.device_group,
-                    )
-            elif pp_group.is_last_rank:
-                # PP1: receive my shard from PP0
-                if (hasattr(self, "model") and hasattr(self.model, "model")
-                        and hasattr(self.model.model, "embed_tokens")
-                        and hasattr(self.model.model.embed_tokens, "weight")):
-                    torch.distributed.recv(
-                        self.model.model.embed_tokens.weight.data,
-                        src=pp_group.ranks[0],
-                        group=pp_group.device_group,
-                    )
-                    logger.info("PP recv embed_tokens for drafter (shape=%s)",
-                                list(self.model.model.embed_tokens.weight.data.shape))
+        # Last PP rank or PP=1: full load_model.
+        _original_load_model(self, model)
 
     AscendEagleProposer.load_model = _patched_load_model
 
