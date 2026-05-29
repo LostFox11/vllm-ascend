@@ -883,6 +883,18 @@ class NPUModelRunner(GPUModelRunner):
         self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
         self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
 
+        # Keep the upstream ``discard_request_mask`` buffer in sync with the
+        # Ascend-specific ``discard_request_indices``. Several inherited
+        # PP+async helpers (``_is_all_reqs_chunked_prefill``,
+        # ``_pp_broadcast/_receive_prev_sampled_token_ids_to_input_batch``)
+        # read this mask. Without populating it here it stays all-False on
+        # Ascend, which (a) makes the chunked-prefill broadcast-skip dead and
+        # (b) makes the non-last rank build ``prev_req_id_to_index`` over all
+        # requests (including discarded prefill chunks), diverging its state
+        # from the last rank and breaking the symmetry of the PP collectives.
+        self.discard_request_mask.np[:num_reqs] = discard_requests_mask
+        self.discard_request_mask.copy_to_gpu(num_reqs)
+
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
@@ -1893,8 +1905,19 @@ class NPUModelRunner(GPUModelRunner):
             if self.use_async_scheduling and get_pp_group().world_size > 1:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
                 if self.speculative_config is not None and self.num_spec_tokens > 0:
-                    self._pp_receive_valid_sampled_token_count()
-                    self._pp_receive_draft_token_ids()
+                    if self._is_all_reqs_chunked_prefill():
+                        # All requests are chunked prefill: the last rank skips
+                        # the matching broadcasts (the spec state is dummy and
+                        # never consumed). Skip the receives symmetrically and
+                        # clear stale spec state so the next step's
+                        # _prepare_inputs does not apply a spec KV correction
+                        # with a tensor from a previous step.
+                        self._pp_valid_sampled_token_count = None
+                        self._draft_token_ids = None
+                        self.valid_sampled_token_count_gpu = None
+                    else:
+                        self._pp_receive_valid_sampled_token_count()
+                        self._pp_receive_draft_token_ids()
             if not kv_connector_output:
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
@@ -2053,22 +2076,26 @@ class NPUModelRunner(GPUModelRunner):
             and self.speculative_config is not None
             and self.num_spec_tokens > 0
         ):
-
-            valid_sampled_token_count = self._get_valid_sampled_token_count_tensor(
-                sampler_output.sampled_token_ids
-            )
-            self._pp_broadcast_valid_sampled_token_count(valid_sampled_token_count)
-
-            draft_token_ids = self._get_padded_draft_token_ids(
-                len(self.input_batch.req_ids)
-            )
-            if draft_token_ids is None:
-                draft_token_ids = torch.zeros(
-                    (len(self.input_batch.req_ids), self.num_spec_tokens),
-                    dtype=torch.int32,
-                    device=self.device,
+            if not self._is_all_reqs_chunked_prefill():
+                # When all requests are chunked prefill the counts/draft are
+                # dummy and discarded on every rank, so the collective is
+                # skipped. The non-last ranks skip the matching receives via the
+                # same condition (keeping the broadcast symmetric).
+                valid_sampled_token_count = self._get_valid_sampled_token_count_tensor(
+                    sampler_output.sampled_token_ids
                 )
-            self._pp_broadcast_draft_token_ids(draft_token_ids)
+                self._pp_broadcast_valid_sampled_token_count(valid_sampled_token_count)
+
+                draft_token_ids = self._get_padded_draft_token_ids(
+                    len(self.input_batch.req_ids)
+                )
+                if draft_token_ids is None:
+                    draft_token_ids = torch.zeros(
+                        (len(self.input_batch.req_ids), self.num_spec_tokens),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                self._pp_broadcast_draft_token_ids(draft_token_ids)
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
