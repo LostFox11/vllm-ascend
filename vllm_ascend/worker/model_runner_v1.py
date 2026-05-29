@@ -1903,10 +1903,18 @@ class NPUModelRunner(GPUModelRunner):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs and get_pp_group().is_last_rank:
                 if isinstance(hidden_states, tuple):
-                    _hs0_shape = hidden_states[0].shape if len(hidden_states) > 0 else "N/A"
+                    _hs0 = hidden_states[0]  # main hidden tensor [N, hidden]
                     _aux_len = len(hidden_states[1]) if len(hidden_states) > 1 else 0
                     print(f"[DBG_RS] rank={get_pp_group().rank_in_group} UNPACK_TUPLE "
-                          f"hs_shape={list(_hs0_shape)} aux_list_len={_aux_len}")
+                          f"hs_shape={list(_hs0.shape)} aux_list_len={_aux_len}")
+                    # [DBG] 检查 all-gather 后不同行的 hidden states 是否相同
+                    if _hs0.dim() == 2 and _hs0.shape[0] > 1:
+                        _all_same = all(
+                            torch.equal(_hs0[r], _hs0[0]) for r in range(1, _hs0.shape[0])
+                        )
+                        print(f"[DBG_RS] rank={get_pp_group().rank_in_group} HS_CHECK "
+                              f"all_rows_identical={_all_same} "
+                              f"row0_first10={_hs0[0, :10].tolist()}")
                 hidden_states, aux_hidden_states = hidden_states
             if self.pcp_size > 1:
                 # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
@@ -2452,9 +2460,12 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
+            # [FIX] 在 SP (flash_comm_v1) 场景下, all-gather 会将不同 TP rank 的
+            # hidden_states 拼接到 dim 0, 但 compute_logits 用的 logits_indices
+            # 仍然是基于原始 token 序号的, 与 all-gather 后的排列不匹配.
+            # 这里临时跳过 all-gather 看是否能消除重复输出.
             _before = hidden_states
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
-            # [DBG] 检查 all-gather 是否改变了 hidden_states 维度
             if isinstance(hidden_states, tuple):
                 _after_shape = hidden_states[0].shape
             elif isinstance(hidden_states, torch.Tensor):
@@ -2468,6 +2479,8 @@ class NPUModelRunner(GPUModelRunner):
             print(f"[DBG_RS] ALLGATHER rank={get_pp_group().rank_in_group} "
                   f"before={list(_before_shape)} after={list(_after_shape)} "
                   f"pad_size={getattr(forward_context, 'pad_size', -1)}")
+            # [FIX] 可选: 跳过 all-gather, 直接返回原始 hidden_states (非 SP 模式)
+            # hidden_states = _before
         return hidden_states
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
