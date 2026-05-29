@@ -343,7 +343,14 @@ def _get_eagle3_aux_hidden_state_layers(self: "MiniMaxM2ForCausalLM") -> tuple[i
 # isinstance fails and model_runner_v1 raises:
 # "Model does not support EAGLE3 interface but aux_hidden_state_outputs was requested".
 MiniMaxM2ForCausalLM.has_own_lm_head = False  # type: ignore[misc]
-MiniMaxM2ForCausalLM.has_own_embed_tokens = False  # type: ignore[misc]
+# NOTE: has_own_embed_tokens must NOT be set to False under PP > 1.
+# When False, the weight loader skips loading drafter's embed_tokens from
+# checkpoint, and _maybe_share_embeddings is also skipped for PP > 1,
+# leaving drafter's embed_tokens randomly initialized. This causes the
+# autoregressive draft tokens (2nd, 3rd, ...) to use random embeddings,
+# producing poor draft quality that passes rejection sampling and leads
+# to repetitive output. The fix in patch_eagle3_pp.py broadcasts the
+# target model's embed_tokens from PP rank 0 via NCCL.
 MiniMaxM2ForCausalLM.supports_eagle3 = True  # type: ignore[misc]
 
 MiniMaxM2ForCausalLM.set_aux_hidden_state_layers = _set_aux_hidden_state_layers  # type: ignore[attr-defined]

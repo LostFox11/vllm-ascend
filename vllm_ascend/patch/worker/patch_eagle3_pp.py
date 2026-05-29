@@ -22,12 +22,15 @@
 import torch
 import torch.nn as nn
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.models.llama_eagle3 import (
     Eagle3LlamaForCausalLM,
     LlamaModel,
 )
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.sequence import IntermediateTensors
+
+logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Stub helpers for non-last PP ranks
@@ -148,7 +151,9 @@ def _patch_proposer_load_model():
     _original_load_model = AscendEagleProposer.load_model
 
     def _patched_load_model(self, model: nn.Module) -> None:
-        if get_pp_group().world_size > 1 and not get_pp_group().is_last_rank:
+        pp_group = get_pp_group()
+
+        if pp_group.world_size > 1 and not pp_group.is_last_rank:
             # Non-last PP rank: only create the draft model stub, skip
             # attention-layer discovery, kernel config, and weight sharing.
             with self.maybe_eager_context:
@@ -156,10 +161,42 @@ def _patch_proposer_load_model():
             self._draft_attn_layer_names = set()
             self.attn_layer_names = []
             self.piece_all_attn_layer_name = []
-            return
+            # 不 return——下面的 broadcast 需要所有 rank 参与
+        else:
+            # Last PP rank or PP=1: full load_model.
+            _original_load_model(self, model)
 
-        # Last PP rank or PP=1: full load_model.
-        _original_load_model(self, model)
+        # [FIX] PP > 1: broadcast embed_tokens from rank 0 to last rank.
+        # PP 下 _maybe_share_embeddings 被跳过, 但 Eagle3 checkpoint 通常不带
+        # 独立 embed_tokens 权重, drafter 的 embed_tokens 随机初始化.
+        # autoregressive 的 2nd/3rd draft token 用随机 embedding → 低质量预测.
+        if pp_group.world_size > 1:
+            if pp_group.is_first_rank:
+                # Rank 0: target model 有真实 embed_tokens → send
+                if (hasattr(model.model, "embed_tokens")
+                        and hasattr(model.model.embed_tokens, "weight")):
+                    torch.distributed.broadcast(
+                        model.model.embed_tokens.weight.data,
+                        src=pp_group.ranks[0],
+                        group=pp_group.device_group,
+                    )
+            else:
+                # Non-first rank: 参与 broadcast, 接收 embed_tokens
+                _dst = None
+                if (hasattr(self, "model") and hasattr(self.model, "model")
+                        and hasattr(self.model.model, "embed_tokens")
+                        and hasattr(self.model.model.embed_tokens, "weight")):
+                    _dst = self.model.model.embed_tokens.weight.data
+                if _dst is not None:
+                    torch.distributed.broadcast(
+                        _dst,
+                        src=pp_group.ranks[0],
+                        group=pp_group.device_group,
+                    )
+                    if pp_group.is_last_rank:
+                        logger.info(
+                            "PP broadcast embed_tokens to drafter (shape=%s)",
+                            list(_dst.shape))
 
     AscendEagleProposer.load_model = _patched_load_model
 
