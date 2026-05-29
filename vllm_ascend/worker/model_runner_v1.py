@@ -1293,15 +1293,15 @@ class NPUModelRunner(GPUModelRunner):
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
         if self.pcp_size > 1:
             logits_indices = logits_indices_pcp
-        # [DBG] 只在 last PP rank 打印 draft token 信息
-        _pp_rank = get_pp_group().rank_in_group if get_pp_group().world_size > 1 else 0
+        # [DBG] 只在 last PP rank 打印 draft token 信息（仅首条 req，避免大 batch 阻塞）
         if get_pp_group().is_last_rank and hasattr(self, "input_batch"):
-            _num_reqs = self.input_batch.num_reqs
-            print(f"[DBG_RS] rank={_pp_rank} num_draft_tokens={num_draft_tokens.tolist()} "
-                  f"draft_ids={draft_token_ids.cpu().tolist()} "
-                  f"logits_idx_0={logits_indices[0].item() if logits_indices.numel()>0 else -1} "
-                  f"total_logits={logits_indices.numel()} "
-                  f"cu_scheduled={cu_num_scheduled_tokens.tolist()}")
+            _draft_list = draft_token_ids.cpu().tolist()
+            if len(_draft_list) <= 10:  # 小 batch 才完整打印
+                print(f"[DBG_RS] rank={get_pp_group().rank_in_group} "
+                      f"num_draft_tokens={num_draft_tokens.tolist()} "
+                      f"draft_ids={_draft_list} "
+                      f"total_logits={logits_indices.numel()} "
+                      f"cu_scheduled={cu_num_scheduled_tokens.tolist()}")
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
@@ -1906,8 +1906,7 @@ class NPUModelRunner(GPUModelRunner):
                     _hs0_shape = hidden_states[0].shape if len(hidden_states) > 0 else "N/A"
                     _aux_len = len(hidden_states[1]) if len(hidden_states) > 1 else 0
                     print(f"[DBG_RS] rank={get_pp_group().rank_in_group} UNPACK_TUPLE "
-                          f"hs_shape={list(_hs0_shape)} aux_list_len={_aux_len} "
-                          f"flash_comm={getattr(get_forward_context(), 'flash_comm_v1_enabled', 'N/A')}")
+                          f"hs_shape={list(_hs0_shape)} aux_list_len={_aux_len}")
                 hidden_states, aux_hidden_states = hidden_states
             if self.pcp_size > 1:
                 # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
