@@ -262,6 +262,15 @@ class NPUModelRunner(GPUModelRunner):
             hf_config is not None and hasattr(hf_config, "compress_ratios")
         )
 
+        # Must be set before super().__init__() because parent init may
+        # initialize the drafter, and we need is_kv_producer to decide
+        # whether to skip it on the P node.
+        self.is_kv_producer = False
+        self.is_kv_consumer = False
+        if vllm_config.kv_transfer_config is not None:
+            self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
+            self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
@@ -420,13 +429,7 @@ class NPUModelRunner(GPUModelRunner):
         self._seq_lens_cpu_event: torch.npu.Event | None = None
         self._seq_lens_cpu_event_pending = False
 
-        # kv role
-        self.is_kv_producer = False
-        self.is_kv_consumer = False
-        if vllm_config.kv_transfer_config is not None:
-            self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
-            self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
-
+        # kv role (is_kv_producer/is_kv_consumer already set before super().__init__)
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.uniform_decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
