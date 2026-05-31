@@ -1090,6 +1090,19 @@ class NPUModelRunner(GPUModelRunner):
             target.gpu[:, :total_num_scheduled_tokens] += drift
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        pp = get_pp_group()
+        if use_spec_decode or self.num_spec_tokens > 0:
+            logger.info(
+                "[DEBUG PP] _prepare_inputs spec_decode: pp_rank=%d/%d "
+                "kv_role=%s use_spec_decode=%d "
+                "scheduled_spec_decode_tokens=%s "
+                "is_kv_consumer=%d",
+                pp.rank, pp.world_size,
+                self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else "none",
+                1 if use_spec_decode else 0,
+                str(scheduler_output.scheduled_spec_decode_tokens),
+                1 if self.is_kv_consumer else 0,
+            )
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -2374,6 +2387,16 @@ class NPUModelRunner(GPUModelRunner):
                 sampling_metadata=sampling_metadata,
             )
 
+        pp = get_pp_group()
+        logger.info(
+            "[DEBUG PP] _sample rejection: pp_rank=%d/%d kv_role=%s "
+            "logits.shape=%s num_draft_tokens=%s max_spec_len=%d",
+            pp.rank, pp.world_size,
+            self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else "none",
+            str(logits.shape),
+            str(spec_decode_metadata.num_draft_tokens),
+            spec_decode_metadata.max_spec_len,
+        )
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
         if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
@@ -2384,6 +2407,20 @@ class NPUModelRunner(GPUModelRunner):
             None,  # draft_probs
             logits,
             sampling_metadata,
+        )
+        pp = get_pp_group()
+        try:
+            ids_str = str(sampler_output.sampled_token_ids.detach().clone().cpu().tolist())
+        except Exception:
+            ids_str = "<copy_failed>"
+        logger.info(
+            "[DEBUG PP] _sample rejection DONE: pp_rank=%d/%d kv_role=%s "
+            "sampled_token_ids.shape=%s "
+            "sampled_token_ids=%s",
+            pp.rank, pp.world_size,
+            self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else "none",
+            str(sampler_output.sampled_token_ids.shape),
+            ids_str,
         )
         return sampler_output
 
