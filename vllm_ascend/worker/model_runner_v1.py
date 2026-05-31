@@ -2046,6 +2046,16 @@ class NPUModelRunner(GPUModelRunner):
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
+                pp = get_pp_group()
+                logger.info(
+                    "[DEBUG PP] execute_model compute_logits: pp_rank=%d/%d "
+                    "kv_role=%s logits.shape=%s hidden_states.shape=%s "
+                    "num_tokens=%d",
+                    pp.rank, pp.world_size,
+                    self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else "none",
+                    str(logits.shape), str(hidden_states.shape),
+                    num_scheduled_tokens,
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -2096,6 +2106,18 @@ class NPUModelRunner(GPUModelRunner):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+
+        pp = get_pp_group()
+        logger.info(
+            "[DEBUG PP] sample_tokens ENTRY: pp_rank=%d/%d is_last=%d "
+            "kv_role=%s execute_model_state_is_none=%d "
+            "drafter_is_none=%d num_spec_tokens=%d",
+            pp.rank, pp.world_size, 1 if pp.is_last_rank else 0,
+            self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else "none",
+            1 if self.execute_model_state is None else 0,
+            1 if self.drafter is None else 0,
+            self.num_spec_tokens,
+        )
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
@@ -2170,6 +2192,22 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
+            pp = get_pp_group()
+            dt = self._draft_token_ids
+            if torch.is_tensor(dt):
+                try:
+                    vals = dt.detach().clone().cpu().tolist()
+                except Exception:
+                    vals = "<copy_failed>"
+            else:
+                vals = str(dt)
+            logger.info(
+                "[DEBUG PP] propose_draft_token_ids DONE: pp_rank=%d/%d "
+                "kv_role=%s _draft_token_ids=%s",
+                pp.rank, pp.world_size,
+                self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else "none",
+                str(vals),
+            )
 
         (
             logprobs_lists,
