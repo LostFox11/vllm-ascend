@@ -1127,6 +1127,7 @@ class MooncakeConnectorScheduler:
             remote_dcp_size=self.dcp_size,
             remote_ptp_size=self.tp_size,
             last_token_id=request.output_token_ids[-1],
+            draft_token_ids=list(request.spec_token_ids),
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
         )

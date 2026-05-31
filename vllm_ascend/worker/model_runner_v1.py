@@ -553,11 +553,7 @@ class NPUModelRunner(GPUModelRunner):
             spec_token_num = self.speculative_config.num_speculative_tokens
             assert spec_token_num > 0
             self.decode_token_per_req = 1 + spec_token_num
-            # P node (kv_producer) never runs MTP — only the D node does.
-            # This avoids generating draft tokens on the P node that would
-            # be lost during PD KV transfer (request_finished only sends
-            # last_token_id, not draft_token_ids).
-            if get_pp_group().is_last_rank and not self.is_kv_producer:
+            if get_pp_group().is_last_rank:
                 self.drafter = self._get_drafter()
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, AscendEagleProposer)
