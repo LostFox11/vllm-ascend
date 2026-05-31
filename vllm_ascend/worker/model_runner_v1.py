@@ -551,7 +551,7 @@ class NPUModelRunner(GPUModelRunner):
             assert spec_token_num > 0
             self.decode_token_per_req = 1 + spec_token_num
             if get_pp_group().is_last_rank:
-                if self.is_kv_producer:
+                if self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer:
                     # P node: never run MTP. Draft tokens would be lost
                     # during PD KV transfer, and the P node's first
                     # decode doesn't need spec decoding anyway.
