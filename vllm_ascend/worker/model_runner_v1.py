@@ -262,15 +262,6 @@ class NPUModelRunner(GPUModelRunner):
             hf_config is not None and hasattr(hf_config, "compress_ratios")
         )
 
-        # Must be set before super().__init__() because parent init may
-        # initialize the drafter, and we need is_kv_producer to decide
-        # whether to skip it on the P node.
-        self.is_kv_producer = False
-        self.is_kv_consumer = False
-        if vllm_config.kv_transfer_config is not None:
-            self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
-            self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
-
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
@@ -429,7 +420,13 @@ class NPUModelRunner(GPUModelRunner):
         self._seq_lens_cpu_event: torch.npu.Event | None = None
         self._seq_lens_cpu_event_pending = False
 
-        # kv role (is_kv_producer/is_kv_consumer already set before super().__init__)
+        # kv role
+        self.is_kv_producer = False
+        self.is_kv_consumer = False
+        if vllm_config.kv_transfer_config is not None:
+            self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
+            self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.uniform_decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
@@ -554,14 +551,20 @@ class NPUModelRunner(GPUModelRunner):
             assert spec_token_num > 0
             self.decode_token_per_req = 1 + spec_token_num
             if get_pp_group().is_last_rank:
-                self.drafter = self._get_drafter()
-                if self.speculative_config.method == "eagle3":
-                    assert isinstance(self.drafter, AscendEagleProposer)
-                    self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
-                elif self.speculative_config.method == "extract_hidden_states":
-                    assert isinstance(self.drafter, AscendExtractHiddenStatesProposer)
-                    self.use_aux_hidden_state_outputs = True
-                self.rejection_sampler = AscendRejectionSampler(self.sampler)
+                if self.is_kv_producer:
+                    # P node: never run MTP. Draft tokens would be lost
+                    # during PD KV transfer, and the P node's first
+                    # decode doesn't need spec decoding anyway.
+                    self.drafter = None
+                else:
+                    self.drafter = self._get_drafter()
+                    if self.speculative_config.method == "eagle3":
+                        assert isinstance(self.drafter, AscendEagleProposer)
+                        self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
+                    elif self.speculative_config.method == "extract_hidden_states":
+                        assert isinstance(self.drafter, AscendExtractHiddenStatesProposer)
+                        self.use_aux_hidden_state_outputs = True
+                    self.rejection_sampler = AscendRejectionSampler(self.sampler)
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
 
@@ -1093,19 +1096,6 @@ class NPUModelRunner(GPUModelRunner):
             target.gpu[:, :total_num_scheduled_tokens] += drift
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-        pp = get_pp_group()
-        if use_spec_decode or self.num_spec_tokens > 0:
-            logger.info(
-                "[DEBUG PP] _prepare_inputs spec_decode: pp_rank=%d/%d "
-                "kv_role=%s use_spec_decode=%d "
-                "scheduled_spec_decode_tokens=%s "
-                "is_kv_consumer=%d",
-                pp.rank, pp.world_size,
-                self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else "none",
-                1 if use_spec_decode else 0,
-                str(scheduler_output.scheduled_spec_decode_tokens),
-                1 if self.is_kv_consumer else 0,
-            )
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -2062,16 +2052,6 @@ class NPUModelRunner(GPUModelRunner):
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
-                pp = get_pp_group()
-                logger.info(
-                    "[DEBUG PP] execute_model compute_logits: pp_rank=%d/%d "
-                    "kv_role=%s logits.shape=%s hidden_states.shape=%s "
-                    "num_tokens=%d",
-                    pp.rank, pp.world_size,
-                    self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else "none",
-                    str(logits.shape), str(hidden_states.shape),
-                    num_scheduled_tokens,
-                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -2122,18 +2102,6 @@ class NPUModelRunner(GPUModelRunner):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
-
-        pp = get_pp_group()
-        logger.info(
-            "[DEBUG PP] sample_tokens ENTRY: pp_rank=%d/%d is_last=%d "
-            "kv_role=%s execute_model_state_is_none=%d "
-            "drafter_is_none=%d num_spec_tokens=%d",
-            pp.rank, pp.world_size, 1 if pp.is_last_rank else 0,
-            self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else "none",
-            1 if self.execute_model_state is None else 0,
-            1 if self.drafter is None else 0,
-            self.num_spec_tokens,
-        )
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
@@ -2208,22 +2176,6 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
-            pp = get_pp_group()
-            dt = self._draft_token_ids
-            if torch.is_tensor(dt):
-                try:
-                    vals = dt.detach().clone().cpu().tolist()
-                except Exception:
-                    vals = "<copy_failed>"
-            else:
-                vals = str(dt)
-            logger.info(
-                "[DEBUG PP] propose_draft_token_ids DONE: pp_rank=%d/%d "
-                "kv_role=%s _draft_token_ids=%s",
-                pp.rank, pp.world_size,
-                self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else "none",
-                str(vals),
-            )
 
         (
             logprobs_lists,
@@ -2390,16 +2342,6 @@ class NPUModelRunner(GPUModelRunner):
                 sampling_metadata=sampling_metadata,
             )
 
-        pp = get_pp_group()
-        logger.info(
-            "[DEBUG PP] _sample rejection: pp_rank=%d/%d kv_role=%s "
-            "logits.shape=%s num_draft_tokens=%s max_spec_len=%d",
-            pp.rank, pp.world_size,
-            self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else "none",
-            str(logits.shape),
-            str(spec_decode_metadata.num_draft_tokens),
-            spec_decode_metadata.max_spec_len,
-        )
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
         if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
@@ -2410,20 +2352,6 @@ class NPUModelRunner(GPUModelRunner):
             None,  # draft_probs
             logits,
             sampling_metadata,
-        )
-        pp = get_pp_group()
-        try:
-            ids_str = str(sampler_output.sampled_token_ids.detach().clone().cpu().tolist())
-        except Exception:
-            ids_str = "<copy_failed>"
-        logger.info(
-            "[DEBUG PP] _sample rejection DONE: pp_rank=%d/%d kv_role=%s "
-            "sampled_token_ids.shape=%s "
-            "sampled_token_ids=%s",
-            pp.rank, pp.world_size,
-            self.vllm_config.kv_transfer_config.kv_role if self.vllm_config.kv_transfer_config else "none",
-            str(sampler_output.sampled_token_ids.shape),
-            ids_str,
         )
         return sampler_output
 

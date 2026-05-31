@@ -1042,16 +1042,6 @@ class MooncakeConnectorScheduler:
             params,
         )
 
-        # When the P node ran MTP before transferring, carry over the bonus
-        # token and draft tokens so the D node's scheduler has correct
-        # token accounting (num_tokens / num_tokens_with_spec / spec_token_ids).
-        if params and params.get("do_remote_decode"):
-            if "last_token_id" in params:
-                request._output_token_ids.append(params["last_token_id"])
-                request._all_token_ids.append(params["last_token_id"])
-            if "draft_token_ids" in params and not request.spec_token_ids:
-                request.spec_token_ids = list(params["draft_token_ids"])
-
         if params is not None and (params.get("do_remote_prefill", False) or params.get("do_remote_decode", False)):
             self._reqs_in_batch.add(request.request_id)
         if params is not None and params.get("do_remote_prefill"):
@@ -1137,7 +1127,6 @@ class MooncakeConnectorScheduler:
             remote_dcp_size=self.dcp_size,
             remote_ptp_size=self.tp_size,
             last_token_id=request.output_token_ids[-1],
-            draft_token_ids=list(request.spec_token_ids),
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
         )
