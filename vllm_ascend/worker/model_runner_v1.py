@@ -2011,8 +2011,9 @@ class NPUModelRunner(GPUModelRunner):
         self._draft_token_ids = None
         if hasattr(self, "_draft_token_req_ids"):
             self._draft_token_req_ids = None
-        
+
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None # type: ignore[no-redef]
+        self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -2032,6 +2033,34 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
+        skip_pp_token_state = (
+            self.use_async_scheduling
+            and self._async_spec_state_can_be_skipped(
+                include_current_sample=True
+            )
+        )
+        defer_pp_token_state_comm = self._pp_should_defer_token_state_comm()
+
+        use_padded_batch = (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
+            and not self.speculative_config.disable_padded_drafter_batch
+        )
+        propose_drafts_after_bookkeeping = False
+        with record_function_or_nullcontext("draft_token"):
+            if self.speculative_config and not skip_pp_token_state:
+                if use_padded_batch:
+                    # Padded draft-model/MTP paths must see the request state
+                    # before async bookkeeping appends -1 placeholders.
+                    propose_draft_token_ids(sampler_output.sampled_token_ids)
+                else:
+                    propose_drafts_after_bookkeeping = True
+
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -2048,38 +2077,18 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
         )
 
-        skip_pp_token_state = (
-            self.use_async_scheduling
-            and self._async_spec_state_can_be_skipped()
-        )
-        defer_pp_token_state_comm = self._pp_should_defer_token_state_comm()
-
-        with record_function_or_nullcontext("draft_token"):
-            if self.speculative_config and not skip_pp_token_state:
-                use_padded_batch = (
-                    self.speculative_config
-                    and get_pp_group().is_last_rank
-                    and (
-                        self.speculative_config.use_eagle()
-                        or self.speculative_config.uses_draft_model()
-                        or self.speculative_config.uses_extract_hidden_states()
-                    )
-                    and not self.speculative_config.disable_padded_drafter_batch
-                )
-                if use_padded_batch:
-                    # EAGLE speculative decoding can use the GPU sampled tokens
-                    # as inputs, and does not need to wait for bookkeeping to finish.
-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch:
-                    # ngram and other speculative decoding methods use the sampled
-                    # tokens on the CPU, so they are run after bookkeeping.
+        if propose_drafts_after_bookkeeping:
+            with record_function_or_nullcontext("draft_token"):
+                if self.speculative_config and not skip_pp_token_state:
+                    # Ngram and other non-padded methods use CPU-side sampled
+                    # token lists produced by bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
 
-            # vLLM v0.18 defers KV connector finalization during target-model
-            # forward when speculative decoding is enabled. Finalize here after
-            # draft model runs so KV pool save/put can complete.
-            if self.speculative_config is not None:
-                self.finalize_kv_connector()
+        # vLLM v0.18 defers KV connector finalization during target-model
+        # forward when speculative decoding is enabled. Finalize here after
+        # draft model runs so KV pool save/put can complete.
+        if self.speculative_config is not None:
+            self.finalize_kv_connector()
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -2199,6 +2208,12 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
+        if (
+            self.use_async_scheduling
+            and getattr(self, "_draft_token_req_ids", None) is not None
+        ):
+            draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
+            self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             None,  # draft_probs

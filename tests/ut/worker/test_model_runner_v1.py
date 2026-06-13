@@ -146,6 +146,61 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
         self.assertEqual(actual_output_token_ids[0], [1, 2, 3, 6])
         self.assertEqual(actual_output_token_ids[1], [4, 5, 7])
 
+    @patch("vllm_ascend.worker.model_runner_v1.lmhead_tp_enable")
+    def test_sample_updates_async_spec_token_ids_before_rejection(
+        self,
+        mock_lmhead_tp_enable,
+    ):
+        mock_lmhead_tp_enable.return_value = False
+
+        input_batch = MagicMock()
+        input_batch.sampling_metadata = SimpleNamespace(
+            output_token_ids=[],
+            spec_token_ids=[[101, 102]],
+        )
+
+        runner = self._build_runner()
+        runner.use_async_scheduling = True
+        runner.input_batch = input_batch
+        runner._draft_token_req_ids = ["req0"]
+        runner._get_draft_token_ids_cpu = MagicMock(
+            return_value=([[201, 202, 203]], ["req0"])
+        )
+
+        events = []
+
+        def update_async_spec_token_ids(draft_token_ids):
+            events.append(("spec_update", draft_token_ids))
+
+        def rejection_sampler(*args, **kwargs):
+            events.append(("rejection", None))
+            return MagicMock()
+
+        input_batch.update_async_spec_token_ids.side_effect = (
+            update_async_spec_token_ids
+        )
+        input_batch.update_async_output_token_ids.side_effect = (
+            lambda: events.append(("output_update", None))
+        )
+        runner.rejection_sampler = MagicMock(side_effect=rejection_sampler)
+
+        runner._sample(
+            logits=torch.randn(3, 16),
+            spec_decode_metadata=SimpleNamespace(
+                logits_indices=torch.tensor([0, 1, 2])
+            ),
+        )
+
+        self.assertEqual(
+            events,
+            [
+                ("output_update", None),
+                ("spec_update", [[201, 202, 203]]),
+                ("rejection", None),
+            ],
+        )
+        runner._get_draft_token_ids_cpu.assert_called_once()
+
 
 class TestNPUModelRunnerAsyncSpecSkip(unittest.TestCase):
 
@@ -418,6 +473,105 @@ class TestNPUModelRunnerAsyncSpecSkip(unittest.TestCase):
         self.assertIs(runner.valid_sampled_token_count_gpu, valid_count)
         self.assertEqual(runner._pp_valid_sampled_token_count.tolist(), [2])
         self.assertEqual(runner._async_pp_token_comm_states, [])
+
+
+class TestNPUModelRunnerDraftOrder(unittest.TestCase):
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_padded_draft_runs_before_async_bookkeeping(self, mock_get_pp_group):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.device = torch.device("cpu")
+        runner.use_async_scheduling = False
+        runner.need_accepted_tokens = False
+        runner.broadcast_pp_output = False
+        runner.num_spec_tokens = 3
+        runner.kv_connector_output = None
+        runner.supports_mm_inputs = False
+        runner.dynamic_eplb = False
+        runner.debugger = None
+        runner.ascend_config = SimpleNamespace(
+            profiling_chunk_config=SimpleNamespace(need_timing=False),
+        )
+        runner.model_config = SimpleNamespace(enable_return_routed_experts=False)
+        runner.input_batch = SimpleNamespace(
+            prev_sampled_token_ids=torch.tensor([[999]], dtype=torch.int32),
+            sampling_metadata=SimpleNamespace(),
+            req_ids=["req0"],
+            vocab_size=32000,
+        )
+        runner.finalize_kv_connector = MagicMock()
+        runner._copy_draft_token_ids_to_cpu = MagicMock()
+        runner._update_states_after_model_execute = MagicMock()
+        runner._pp_should_defer_token_state_comm = MagicMock(return_value=False)
+
+        spec_config = MagicMock()
+        spec_config.use_eagle.return_value = False
+        spec_config.uses_draft_model.return_value = True
+        spec_config.uses_extract_hidden_states.return_value = False
+        spec_config.disable_padded_drafter_batch = False
+        runner.speculative_config = spec_config
+
+        mock_get_pp_group.return_value = SimpleNamespace(
+            is_last_rank=True,
+            world_size=1,
+        )
+
+        events = []
+
+        def propose_draft_token_ids(*args, **kwargs):
+            self.assertNotIn("bookkeep", events)
+            self.assertIsNone(runner.input_batch.prev_sampled_token_ids)
+            events.append("draft")
+            runner.input_batch.prev_sampled_token_ids = torch.tensor(
+                [[42]], dtype=torch.int32
+            )
+            return torch.tensor([[1, 2, 3]], dtype=torch.int32)
+
+        def bookkeeping(*args, **kwargs):
+            self.assertEqual(events, ["draft"])
+            events.append("bookkeep")
+            return (
+                None,
+                [[42]],
+                {},
+                ["req0"],
+                {"req0": 0},
+                [],
+            )
+
+        runner.propose_draft_token_ids = MagicMock(
+            side_effect=propose_draft_token_ids
+        )
+        runner._bookkeeping_sync = MagicMock(side_effect=bookkeeping)
+        runner._sample = MagicMock(
+            return_value=SimpleNamespace(
+                sampled_token_ids=torch.tensor(
+                    [[10, 11, -1, -1]], dtype=torch.int32
+                ),
+                logprobs_tensors=None,
+            )
+        )
+        runner.execute_model_state = (
+            SimpleNamespace(total_num_scheduled_tokens=1),
+            torch.zeros((1, 1)),
+            SimpleNamespace(),
+            None,
+            SimpleNamespace(),
+            torch.zeros((1, 1)),
+            None,
+            None,
+            None,
+            torch.zeros((1,), dtype=torch.int64),
+            None,
+            None,
+            None,
+        )
+
+        output = runner.sample_tokens(grammar_output=None)
+
+        self.assertEqual(events, ["draft", "bookkeep"])
+        self.assertEqual(output.sampled_token_ids, [[42]])
+        runner.finalize_kv_connector.assert_called_once()
 
 
 if __name__ == "__main__":
