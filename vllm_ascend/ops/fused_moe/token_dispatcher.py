@@ -143,6 +143,12 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         # NOTE: When enable_mc2_hierarchy_comm is true, we need pass in `comm_alg` to mc2 op.
         self.need_comm_alg = get_ascend_config().enable_mc2_hierarchy_comm
 
+        # PD separation detection: P (kv_producer) uses fullmesh_v2, D (kv_consumer) uses hierarchy.
+        self.is_kv_consumer = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_consumer
+        self.is_pd = vllm_config.kv_transfer_config is not None
+        if self.is_pd:
+            self.need_comm_alg = True
+
         if not self.enable_dispatch_v2 and self.need_comm_alg:
             raise RuntimeError(
                 "PTA and CANN version is too old to support mc2 hierarchy comm, please upgrade your version."
@@ -201,7 +207,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         # Only dispatch-enabled MXFP paths pass y_dtype through MC2.
         if (
             self.a5_need_extra_args
-            and (token_dispatch_input.quant.is_mxfp or token_dispatch_input.quant.is_fp8)
+            and token_dispatch_input.quant.is_mxfp
             and token_dispatch_input.quant.dispatch_with_quant
         ):
             y_dtype = torch.float8_e4m3fn
@@ -218,7 +224,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
                 }
             )
         if self.need_comm_alg:
-            stage1_kwargs.update({"comm_alg": "hierarchy"})
+            # PD separation: P (kv_producer) uses fullmesh_v2, D (kv_consumer) uses hierarchy.
+            if self.is_pd and not self.is_kv_consumer:
+                stage1_kwargs.update({"comm_alg": "fullmesh_v2"})
+            else:
+                stage1_kwargs.update({"comm_alg": "hierarchy"})
 
         kwargs_mc2.update(stage1_kwargs)
         return kwargs_mc2
@@ -322,7 +332,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
                 }
             )
         if self.need_comm_alg:
-            stage3_kwargs.update({"comm_alg": "hierarchy"})
+            # PD separation: P (kv_producer) uses fullmesh_v2, D (kv_consumer) uses hierarchy.
+            if self.is_pd and not self.is_kv_consumer:
+                stage3_kwargs.update({"comm_alg": "fullmesh_v2"})
+            else:
+                stage3_kwargs.update({"comm_alg": "hierarchy"})
 
         kwargs_mc2.update(stage3_kwargs)
         return kwargs_mc2
@@ -356,9 +370,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         # TODO: After AllGather MXFP4 communication quantization thorough verification, remove this judgment.
         #  MXFP4 keeps dispatch unquantized in AllGather path, and quantizes again inside the MLP path.
         with_quant = (
-            token_dispatch_input.quant.dispatch_with_quant
-            and token_dispatch_input.quant.quant_type != QuantType.MXFP4
-            and token_dispatch_input.quant.quant_type != QuantType.W8A8FP8
+            token_dispatch_input.quant.dispatch_with_quant and token_dispatch_input.quant.quant_type != QuantType.MXFP4
         )
         is_mxfp = token_dispatch_input.quant.is_mxfp
         hidden_states = token_dispatch_input.hidden_states
@@ -468,7 +480,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         self,
         token_dispatch_input: MoETokenDispatchInput,
     ):
-        with_quant = token_dispatch_input.quant.is_int_quant or token_dispatch_input.quant.is_fp8
+        with_quant = token_dispatch_input.quant.is_int_quant
         hidden_states = token_dispatch_input.hidden_states
         topk_weights = token_dispatch_input.topk_weights
         topk_ids = token_dispatch_input.topk_ids
@@ -486,10 +498,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
 
         dynamic_scale_after_all2all = None
         if with_quant:
-            dst_type = torch.float8_e4m3fn if token_dispatch_input.quant.is_fp8 else torch.int8
-            permutated_local_input_tokens, dynamic_scale = torch_npu.npu_dynamic_quant(
-                permutated_local_input_tokens, dst_type=dst_type
-            )
+            permutated_local_input_tokens, dynamic_scale = torch_npu.npu_dynamic_quant(permutated_local_input_tokens)
             _, dynamic_scale_after_all2all, permute2_ep_all_to_all_handle = async_all_to_all(
                 dynamic_scale, output_splits, input_splits, self.ep_group
             )
