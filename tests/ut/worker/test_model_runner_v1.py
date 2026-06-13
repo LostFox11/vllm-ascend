@@ -200,6 +200,37 @@ class TestNPUModelRunnerAsyncSpecSkip(unittest.TestCase):
         self.assertFalse(runner._async_spec_state_can_be_skipped())
         self.assertFalse(runner._pp_skip_sampled_token_broadcast())
 
+    def test_spec_decode_batch_never_skips_pp_token_state(self):
+        runner = self._build_runner([(1, 1)])
+        runner._pp_current_batch_has_spec_decode = True
+
+        self.assertTrue(runner._all_sampled_reqs_reached_max_tokens())
+        self.assertFalse(runner._async_spec_state_can_be_skipped())
+        self.assertFalse(runner._pp_skip_sampled_token_broadcast())
+
+    def test_tensor_draft_token_ids_are_padded_to_request_count(self):
+        runner = self._build_runner([(4, 1)])
+        runner.device = torch.device("cpu")
+        runner.num_spec_tokens = 3
+        runner._draft_token_ids = torch.tensor(
+            [[1, 2, 3], [4, 5, 6]],
+            dtype=torch.int64,
+        )
+
+        draft_token_ids = runner._get_padded_draft_token_ids(num_reqs=1)
+
+        self.assertEqual(draft_token_ids.dtype, torch.int32)
+        self.assertEqual(draft_token_ids.tolist(), [[1, 2, 3]])
+
+    def test_spec_decode_prev_map_ignores_discard_mask(self):
+        runner = self._build_runner([(4, 1)], discard_mask=[True])
+        runner._pp_current_batch_has_spec_decode = True
+
+        prev_map = runner._pp_build_prev_req_id_to_index(num_reqs=1)
+
+        self.assertEqual(prev_map, {"req0": 0})
+        self.assertEqual(runner.requests["req0"].output_token_ids, [-1, -1])
+
     def test_kv_producer_does_not_skip_decode_handoff_state_at_max_tokens(self):
         runner = self._build_runner([(1, 1)])
         runner.is_kv_producer = True
@@ -242,6 +273,64 @@ class TestNPUModelRunnerAsyncSpecSkip(unittest.TestCase):
 
         self.assertEqual(runner._pp_valid_sampled_token_count.tolist(), [2])
         self.assertEqual(runner._async_pp_token_comm_states, [])
+
+    def test_sender_async_token_comm_waits_before_sample_returns(self):
+        runner = self._build_runner([(4, 1)])
+        comm_state_cls = __import__(
+            "vllm_ascend.worker.model_runner_v1",
+            fromlist=["AsyncPPTokenCommState"],
+        ).AsyncPPTokenCommState
+
+        class Work:
+            def __init__(self):
+                self.waited = False
+
+            def wait(self):
+                self.waited = True
+
+        work = Work()
+        comm_state = comm_state_cls(works=[work])
+        runner._async_pp_token_comm_states = []
+
+        runner._pp_finish_async_token_comm_after_sample(comm_state)
+
+        self.assertTrue(work.waited)
+        self.assertEqual(runner._async_pp_token_comm_states, [])
+
+    def test_spec_decode_batch_uses_sync_token_state_comm(self):
+        runner = self._build_runner([(4, 1)])
+        runner._pp_current_batch_has_spec_decode = False
+        self.assertTrue(runner._pp_should_defer_token_state_comm())
+
+        runner._pp_current_batch_has_spec_decode = True
+        self.assertFalse(runner._pp_should_defer_token_state_comm())
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_ready_sync_pp_state_is_kept_for_next_execute(self, mock_pp_group):
+        runner = self._build_runner([(4, 1)])
+        runner.use_async_scheduling = True
+        runner.input_batch.prev_sampled_token_ids = torch.tensor([[5]])
+        runner.input_batch.prev_req_id_to_index = {"req0": 0}
+        runner._draft_token_ids = torch.tensor([[7, 8, 9]])
+        runner._pp_valid_sampled_token_count = torch.tensor([2])
+        runner.valid_sampled_token_count_gpu = torch.tensor([2])
+        runner._pp_prev_token_state_ready = True
+        runner._async_pp_token_comm_states = []
+
+        mock_pp_group.return_value = SimpleNamespace(
+            world_size=4,
+            is_last_rank=False,
+        )
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=1,
+            num_scheduled_tokens={"req0": 1},
+        )
+
+        runner._pp_prepare_async_token_state_for_execute(scheduler_output)
+
+        self.assertIsNotNone(runner.input_batch.prev_sampled_token_ids)
+        self.assertEqual(runner.input_batch.prev_req_id_to_index, {"req0": 0})
+        self.assertTrue(runner._pp_current_batch_requires_prev_token_state)
 
     @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
     def test_last_pp_rank_prepare_does_not_clear_local_draft(self, mock_pp_group):
