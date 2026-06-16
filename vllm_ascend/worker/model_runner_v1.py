@@ -4791,7 +4791,7 @@ class NPUModelRunner(GPUModelRunner):
     ) -> torch.Tensor | None:
         draft_token_ids = getattr(self, "_draft_token_ids", None)
         if not torch.is_tensor(draft_token_ids):
-            return super()._get_padded_draft_token_ids(num_reqs)
+            return None
 
         draft_token_ids = draft_token_ids.to(dtype=torch.int32)
         if num_reqs is None or draft_token_ids.dim() != 2:
