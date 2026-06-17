@@ -2382,6 +2382,27 @@ class NPUModelRunner(GPUModelRunner):
         if comm_state is not None:
             self._pp_finish_async_token_comm_after_sample(comm_state)
 
+        # Capture draft token ids for ModelRunnerOutput.spec_token_ids.
+        # This is needed in PP batch_queue mode because EngineCore.post_step
+        # is skipped to avoid racing the shared draft_token_ids_cpu buffer
+        # across batches.
+        output_spec_token_ids = None
+        draft_token_ids = getattr(self, "_draft_token_ids", None)
+        if draft_token_ids is not None:
+            if isinstance(draft_token_ids, torch.Tensor):
+                num_reqs = draft_token_ids.shape[0]
+                draft_ids_list = draft_token_ids[:num_reqs].cpu().tolist()
+                draft_req_ids = getattr(self, "_draft_token_req_ids", None) or self.input_batch.req_ids
+            else:
+                draft_ids_list = draft_token_ids
+                draft_req_ids = self.input_batch.req_ids
+            if draft_ids_list and draft_req_ids:
+                draft_by_req_id = dict(zip(draft_req_ids, draft_ids_list))
+                output_spec_token_ids = [
+                    draft_by_req_id.get(req_id, [])
+                    for req_id in req_ids_output_copy
+                ]
+
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2392,6 +2413,7 @@ class NPUModelRunner(GPUModelRunner):
             pooler_output=[],
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+            spec_token_ids=output_spec_token_ids,
             **(
                 {} if vllm_version_is("0.20.2") else {"routed_experts": routed_experts_lists}
             ),
@@ -4791,7 +4813,7 @@ class NPUModelRunner(GPUModelRunner):
     ) -> torch.Tensor | None:
         draft_token_ids = getattr(self, "_draft_token_ids", None)
         if not torch.is_tensor(draft_token_ids):
-            return None
+            return super()._get_padded_draft_token_ids(num_reqs)
 
         draft_token_ids = draft_token_ids.to(dtype=torch.int32)
         if num_reqs is None or draft_token_ids.dim() != 2:

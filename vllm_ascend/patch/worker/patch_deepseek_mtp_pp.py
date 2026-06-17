@@ -146,11 +146,7 @@ def _patched_mtp_load_weights(
 # ---------------------------------------------------------------------------
 def _patched_mtp_embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
     if get_pp_group().world_size > 1 and not get_pp_group().is_last_rank:
-        # SAFETY: embed_input_ids should not be called on non-last PP ranks
-        # (the MTP model is a stub). Return a zero embedding as a safe default
-        # instead of leaking raw input_ids as embeddings.
-        hidden_size = getattr(self.config, "hidden_size", 1)
-        return torch.zeros(len(input_ids), hidden_size, dtype=torch.bfloat16, device=input_ids.device)
+        return input_ids
     return _original_mtp_embed_input_ids(self, input_ids)
 
 
