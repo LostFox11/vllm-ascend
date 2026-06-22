@@ -2141,7 +2141,7 @@ class NPUModelRunner(GPUModelRunner):
             # receive sampled token ids from the last PP rank when using
             # async scheduling + pipeline parallelism so downstream code
             # (e.g., PCP input preparation) can access them.
-            if self.use_async_scheduling and get_pp_group().world_size > 1:
+            if self.use_async_scheduling and get_pp_group().world_size > 1 and not self.is_kv_producer:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
                 return None  # noqa
@@ -2331,7 +2331,10 @@ class NPUModelRunner(GPUModelRunner):
         # In async scheduling + PP, broadcast sampled token ids from the
         # last PP rank so other PP ranks can receive them without going
         # through the scheduler/engine IPC path.
-        if self.use_async_scheduling:
+        # Skip on the P node in PD separation (kv_producer): P node only
+        # does prefill, the broadcast is unnecessary and creates a
+        # pipeline bubble in the PP pipeline.
+        if self.use_async_scheduling and not self.is_kv_producer:
             pp = get_pp_group()
             if pp.world_size > 1 and pp.is_last_rank:
                 # With spec decoding sampled_token_ids has shape
