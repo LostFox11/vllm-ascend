@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections import Counter
 from functools import wraps
+from inspect import Parameter, signature
 from typing import Iterable
 
 from vllm.logger import logger
@@ -142,19 +143,39 @@ def _iter_decode_req_ids(scheduler: Scheduler, scheduler_output: SchedulerOutput
             yield req_id
 
 
+def _accepts_schedule_args(schedule) -> bool:
+    try:
+        schedule_signature = signature(schedule)
+    except (TypeError, ValueError):
+        return True
+
+    parameters = list(schedule_signature.parameters.values())
+    if any(param.kind in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD) for param in parameters):
+        return True
+    # Unbound methods include ``self``. Newer vLLM schedulers also accept
+    # ``throttle_prefills``; older copied schedulers only accept ``self``.
+    return len(parameters) > 1
+
+
 def _patch_schedule(scheduler_cls: type[Scheduler]) -> None:
     original_schedule = scheduler_cls.schedule
     if getattr(original_schedule, "_vllm_ascend_pp_mtp_scheduler_patched", False):
         return
+    accepts_schedule_args = _accepts_schedule_args(original_schedule)
+
+    def _call_original_schedule(self: Scheduler, *args, **kwargs) -> SchedulerOutput:
+        if accepts_schedule_args:
+            return original_schedule(self, *args, **kwargs)
+        return original_schedule(self)
 
     @wraps(original_schedule)
-    def _patched_schedule(self: Scheduler) -> SchedulerOutput:
+    def _patched_schedule(self: Scheduler, *args, **kwargs) -> SchedulerOutput:
         if not _guard_enabled(self):
-            return original_schedule(self)
+            return _call_original_schedule(self, *args, **kwargs)
 
         inflight = _get_inflight_counter(self)
         if not inflight:
-            return original_schedule(self)
+            return _call_original_schedule(self, *args, **kwargs)
 
         runnable_running: list[Request] = []
         deferred_running: list[Request] = []
@@ -165,14 +186,14 @@ def _patch_schedule(scheduler_cls: type[Scheduler]) -> None:
                 runnable_running.append(request)
 
         if not deferred_running:
-            return original_schedule(self)
+            return _call_original_schedule(self, *args, **kwargs)
 
         original_running = self.running
         original_max_running = self.max_num_running_reqs
         self.running = runnable_running
         self.max_num_running_reqs = max(0, original_max_running - len(deferred_running))
         try:
-            scheduler_output = original_schedule(self)
+            scheduler_output = _call_original_schedule(self, *args, **kwargs)
             current_running = self.running
         finally:
             self.max_num_running_reqs = original_max_running
