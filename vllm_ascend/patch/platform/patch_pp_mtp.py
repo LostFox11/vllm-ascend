@@ -32,6 +32,53 @@ from vllm.logger import logger
 _PATCHED = False
 
 
+def _patch_model_runner_output() -> None:
+    from vllm.v1 import outputs as outputs_mod
+
+    model_runner_output_cls = outputs_mod.ModelRunnerOutput
+    fields = getattr(model_runner_output_cls, "__dataclass_fields__", {})
+    if "spec_token_ids" not in fields:
+        model_runner_output_cls.spec_token_ids = None
+        original_init = model_runner_output_cls.__init__
+        if getattr(original_init, "_vllm_ascend_pp_mtp_patched", False):
+            return
+
+        @wraps(original_init)
+        def _patched_init(self, *args, spec_token_ids=None, **kwargs):
+            original_init(self, *args, **kwargs)
+            self.spec_token_ids = spec_token_ids
+
+        _patched_init._vllm_ascend_pp_mtp_patched = True  # type: ignore[attr-defined]
+        model_runner_output_cls.__init__ = _patched_init
+
+    empty_output = outputs_mod.EMPTY_MODEL_RUNNER_OUTPUT
+    if not hasattr(empty_output, "spec_token_ids"):
+        empty_output.spec_token_ids = None
+
+
+def _patch_engine_core() -> None:
+    from vllm.v1.engine.core import EngineCore
+
+    if getattr(EngineCore.post_step, "_vllm_ascend_pp_mtp_patched", False):
+        return
+
+    original_post_step = EngineCore.post_step
+
+    @wraps(original_post_step)
+    def _patched_post_step(self, model_executed: bool) -> None:
+        if (
+            getattr(self, "batch_queue", None) is not None
+            and not getattr(self, "async_scheduling", False)
+            and getattr(self, "use_spec_decode", False)
+            and model_executed
+        ):
+            return
+        return original_post_step(self, model_executed)
+
+    _patched_post_step._vllm_ascend_pp_mtp_patched = True  # type: ignore[attr-defined]
+    EngineCore.post_step = _patched_post_step
+
+
 def _patch_model_config_validation() -> None:
     from typing import get_args
 
@@ -78,6 +125,8 @@ def _apply_patch() -> None:
     if _PATCHED:
         return
     _PATCHED = True
+    _patch_model_runner_output()
+    _patch_engine_core()
     _patch_model_config_validation()
 
 
