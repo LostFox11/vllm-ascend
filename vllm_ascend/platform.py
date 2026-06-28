@@ -435,6 +435,8 @@ class NPUPlatform(Platform):
             return
 
         kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+        if kv_transfer_config is None:
+            return
         if kv_transfer_config is not None and getattr(kv_transfer_config, "kv_role", None) == "kv_producer":
             return
 
