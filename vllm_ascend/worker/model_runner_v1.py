@@ -2401,13 +2401,23 @@ class NPUModelRunner(GPUModelRunner):
         self.kv_connector_output = None
         pp = get_pp_group()
         skip_pp_pd_broadcast = self.is_kv_producer and pp.world_size > 1
+        # V1 + PP + async: throttling via next_decode_eligible_step
+        # ensures consecutive batches have no shared requests, so the
+        # PP broadcast of sampled/draft tokens is unnecessary.
+        skip_throttle_broadcast = (
+            pp.world_size > 1
+            and self.use_async_scheduling
+        )
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
-            # receive sampled token ids from the last PP rank when using
+            # Receive sampled token ids from the last PP rank when using
             # async scheduling + pipeline parallelism so downstream code
             # (e.g., PCP input preparation) can access them.
-            if self.use_async_scheduling and pp.world_size > 1 and not skip_pp_pd_broadcast:
+            # Skip when throttling is active (V1+PP+async).
+            if (self.use_async_scheduling and pp.world_size > 1
+                    and not skip_pp_pd_broadcast
+                    and not skip_throttle_broadcast):
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
                 return None  # noqa
@@ -2572,8 +2582,11 @@ class NPUModelRunner(GPUModelRunner):
         # In async scheduling + PP, broadcast sampled token ids from the
         # last PP rank so other PP ranks can receive them without going
         # through the scheduler/engine IPC path.
+        # Skip when V1 throttling is active (no shared requests).
         if self.use_async_scheduling:
-            if pp.world_size > 1 and pp.is_last_rank and not skip_pp_pd_broadcast:
+            if (pp.world_size > 1 and pp.is_last_rank
+                    and not skip_pp_pd_broadcast
+                    and not skip_throttle_broadcast):
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
         if not self.use_async_scheduling:

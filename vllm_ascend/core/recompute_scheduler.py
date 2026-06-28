@@ -1048,6 +1048,36 @@ class RecomputeScheduler(Scheduler):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
+        # Sync PP + MTP: post_step is skipped (see patch_pp_mtp.py) to
+        # avoid observing stale request state from a newer batch. Instead,
+        # update spec_token_ids from the model output here, where request
+        # state (is_prefill_chunk, num_computed_tokens) is correct.
+        output_spec_token_ids = getattr(
+            model_runner_output, "spec_token_ids", None
+        )
+        if output_spec_token_ids:
+            for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+                request = self.requests.get(req_id)
+                if request is None or request.is_finished():
+                    continue
+                req_index = model_runner_output.req_id_to_index.get(req_id)
+                if req_index is None:
+                    continue
+                # Only update spec tokens for requests that produced output
+                # in this step (num_tokens_scheduled > num_computed pre-step).
+                generated = sampled_token_ids[req_index] if sampled_token_ids else []
+                if not generated:
+                    request.spec_token_ids = []
+                    continue
+                next_spec_token_ids = output_spec_token_ids[req_index]
+                if self.structured_output_manager.should_advance(request):
+                    metadata = request.structured_output_request
+                    assert metadata is not None and metadata.grammar is not None
+                    next_spec_token_ids = metadata.grammar.validate_tokens(
+                        next_spec_token_ids
+                    )
+                request.spec_token_ids = next_spec_token_ids
+
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
@@ -1120,3 +1150,20 @@ class RecomputeScheduler(Scheduler):
 class AsyncRecomputeScheduler(AsyncScheduler, RecomputeScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        super()._update_after_schedule(scheduler_output)
+        # V1 + PP + async: throttle decode scheduling so the same request
+        # cannot appear in consecutive batches. This guarantees that by
+        # the time a request is scheduled again, its previous output has
+        # been fully processed (num_computed_tokens already adjusted for
+        # rejected spec tokens). Without this, the optimistic advance of
+        # num_computed_tokens in the scheduler races with the output
+        # arrival from the PP batch queue, causing precision errors.
+        if not self.use_v2_model_runner and self.pp_size > 1:
+            for req_id in scheduler_output.num_scheduled_tokens:
+                request = self.requests[req_id]
+                if not request.is_prefill_chunk:
+                    request.next_decode_eligible_step = (
+                        self.current_step + self.pp_size
+                    )
