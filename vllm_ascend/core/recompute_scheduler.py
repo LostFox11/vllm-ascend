@@ -106,6 +106,24 @@ class RecomputeScheduler(Scheduler):
             and self.vllm_config.kv_transfer_config.is_kv_consumer
         )
         self.is_kv_producer = self.vllm_config.kv_transfer_config and self.vllm_config.kv_transfer_config.is_kv_producer
+        self.pp_size = self.parallel_config.pipeline_parallel_size
+
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        super()._update_after_schedule(scheduler_output)
+        # V1 + PP: throttle decode scheduling so the same request
+        # cannot appear in consecutive steps. When max_concurrent_batches
+        # = pp_size, the batch queue can delay output processing, causing
+        # the scheduler to read stale num_computed_tokens (spec tokens
+        # counted optimistically but not yet verified). By enforcing a
+        # pp_size step gap, we guarantee update_from_output has run
+        # before the request is rescheduled.
+        if not self.use_v2_model_runner and self.pp_size > 1:
+            for req_id in scheduler_output.num_scheduled_tokens:
+                request = self.requests[req_id]
+                if not request.is_prefill_chunk:
+                    request.next_decode_eligible_step = (
+                        self.current_step + self.pp_size
+                    )
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -1150,20 +1168,3 @@ class RecomputeScheduler(Scheduler):
 class AsyncRecomputeScheduler(AsyncScheduler, RecomputeScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
-    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
-        super()._update_after_schedule(scheduler_output)
-        # V1 + PP + async: throttle decode scheduling so the same request
-        # cannot appear in consecutive batches. This guarantees that by
-        # the time a request is scheduled again, its previous output has
-        # been fully processed (num_computed_tokens already adjusted for
-        # rejected spec tokens). Without this, the optimistic advance of
-        # num_computed_tokens in the scheduler races with the output
-        # arrival from the PP batch queue, causing precision errors.
-        if not self.use_v2_model_runner and self.pp_size > 1:
-            for req_id in scheduler_output.num_scheduled_tokens:
-                request = self.requests[req_id]
-                if not request.is_prefill_chunk:
-                    request.next_decode_eligible_step = (
-                        self.current_step + self.pp_size
-                    )

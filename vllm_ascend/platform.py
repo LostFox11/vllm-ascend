@@ -439,11 +439,13 @@ class NPUPlatform(Platform):
             return
         if kv_transfer_config is not None and getattr(kv_transfer_config, "kv_role", None) == "kv_producer":
             return
+        if kv_transfer_config is not None and getattr(kv_transfer_config, "kv_role", None) == "kv_consumer":
+            return
 
         raise ValueError(
-            "PP+MTP is only supported on PD-disaggregated P nodes "
-            "(kv_role='kv_producer'). D nodes must use "
-            "pipeline_parallel_size=1 and may combine data parallelism with MTP."
+            "PP+MTP is only supported on PD-disaggregated nodes "
+            "(kv_role='kv_producer' or kv_role='kv_consumer'). "
+            f"Got kv_role={getattr(kv_transfer_config, 'kv_role', None)!r}."
         )
 
     @classmethod

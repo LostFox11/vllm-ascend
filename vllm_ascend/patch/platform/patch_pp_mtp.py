@@ -81,13 +81,12 @@ def _patch_engine_core() -> None:
 
 def _patch_scheduler_update_from_output() -> None:
     """Patch Scheduler.update_from_output to consume spec_token_ids from
-    ModelRunnerOutput. In sync PP mode, post_step is skipped (to avoid
-    observing stale request state from a newer batch). Instead, spec
-    tokens are carried on ModelRunnerOutput and consumed here, where
-    request state (is_prefill_chunk, num_computed_tokens) is correct.
+    ModelRunnerOutput. When max_concurrent_batches > 1 in sync PP,
+    post_step is skipped (to avoid stale request state from a newer
+    batch).  Instead, draft tokens are carried on ModelRunnerOutput and
+    consumed here.
     """
     from vllm.v1.core.sched.scheduler import Scheduler
-    from vllm.v1.outputs import ModelRunnerOutput
 
     original = Scheduler.update_from_output
     if getattr(original, "_vllm_ascend_pp_mtp_uof_patched", False):
@@ -97,9 +96,21 @@ def _patch_scheduler_update_from_output() -> None:
     def _patched_update_from_output(
         self,
         scheduler_output,
-        model_runner_output: ModelRunnerOutput,
+        model_runner_output,
     ):
-        result = original(self, scheduler_output, model_runner_output)
+        # PP+MTP can produce 0-token entries in num_scheduled_tokens
+        # (pipeline bubbles).  The base Scheduler.update_from_output
+        # asserts num > 0 for every entry.  Temporarily hide 0-token
+        # entries from the original, then restore them afterwards.
+        num_sched = scheduler_output.num_scheduled_tokens
+        zero_req_ids = [r for r, n in num_sched.items() if n == 0]
+        backup = {r: num_sched[r] for r in zero_req_ids}
+        for r in zero_req_ids:
+            del num_sched[r]
+        try:
+            result = original(self, scheduler_output, model_runner_output)
+        finally:
+            num_sched.update(backup)
 
         output_spec_token_ids = getattr(
             model_runner_output, "spec_token_ids", None
@@ -110,7 +121,7 @@ def _patch_scheduler_update_from_output() -> None:
         sampled_token_ids = getattr(
             model_runner_output, "sampled_token_ids", None
         )
-        for req_id in scheduler_output.num_scheduled_tokens:
+        for req_id in num_sched:
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 continue
