@@ -90,7 +90,13 @@ def _count_reasoning_tokens_for_usage(
 ) -> int | None:
     if reasoning_parser is None:
         return None
-    return reasoning_parser.count_reasoning_tokens(token_ids)
+    reasoning_parser = getattr(reasoning_parser, "reasoning_parser", reasoning_parser)
+    if reasoning_parser is None:
+        return None
+    count_fn = getattr(reasoning_parser, "count_reasoning_tokens", None)
+    if count_fn is None:
+        return None
+    return count_fn(token_ids)
 
 
 def _clamp_reasoning_tokens(
