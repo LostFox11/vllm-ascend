@@ -79,6 +79,65 @@ def _patch_engine_core() -> None:
     EngineCore.post_step = _patched_post_step
 
 
+def _patch_scheduler_update_from_output() -> None:
+    """Patch Scheduler.update_from_output to consume spec_token_ids from
+    ModelRunnerOutput. In sync PP mode, post_step is skipped (to avoid
+    observing stale request state from a newer batch). Instead, spec
+    tokens are carried on ModelRunnerOutput and consumed here, where
+    request state (is_prefill_chunk, num_computed_tokens) is correct.
+    """
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    original = Scheduler.update_from_output
+    if getattr(original, "_vllm_ascend_pp_mtp_uof_patched", False):
+        return
+
+    @wraps(original)
+    def _patched_update_from_output(
+        self,
+        scheduler_output,
+        model_runner_output: ModelRunnerOutput,
+    ):
+        result = original(self, scheduler_output, model_runner_output)
+
+        output_spec_token_ids = getattr(
+            model_runner_output, "spec_token_ids", None
+        )
+        if not output_spec_token_ids:
+            return result
+
+        sampled_token_ids = getattr(
+            model_runner_output, "sampled_token_ids", None
+        )
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            req_index = model_runner_output.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            generated = (
+                sampled_token_ids[req_index] if sampled_token_ids else []
+            )
+            if not generated:
+                request.spec_token_ids = []
+                continue
+            next_spec_token_ids = output_spec_token_ids[req_index]
+            if self.structured_output_manager.should_advance(request):
+                metadata = request.structured_output_request
+                assert metadata is not None and metadata.grammar is not None
+                next_spec_token_ids = metadata.grammar.validate_tokens(
+                    next_spec_token_ids
+                )
+            request.spec_token_ids = next_spec_token_ids
+
+        return result
+
+    _patched_update_from_output._vllm_ascend_pp_mtp_uof_patched = True  # type: ignore[attr-defined]
+    Scheduler.update_from_output = _patched_update_from_output
+
+
 def _patch_model_config_validation() -> None:
     from typing import get_args
 
@@ -127,6 +186,7 @@ def _apply_patch() -> None:
     _PATCHED = True
     _patch_model_runner_output()
     _patch_engine_core()
+    _patch_scheduler_update_from_output()
     _patch_model_config_validation()
 
 
