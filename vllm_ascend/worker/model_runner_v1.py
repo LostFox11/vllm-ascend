@@ -2003,6 +2003,7 @@ class NPUModelRunner(GPUModelRunner):
         assert self.draft_token_ids_cpu is not None
         default_stream = torch.npu.current_stream()
         num_reqs = draft_token_ids.shape[0]
+        self._draft_token_ids_cpu_num_reqs = num_reqs
         with torch.npu.stream(self.draft_token_ids_copy_stream):
             if not zeros_only:
                 self.draft_token_ids_copy_stream.wait_stream(default_stream)
@@ -2606,8 +2607,17 @@ class NPUModelRunner(GPUModelRunner):
             draft_token_ids = self._draft_token_ids if use_pp_spec_decode else None
             if draft_token_ids is not None:
                 if isinstance(draft_token_ids, torch.Tensor):
-                    num_reqs = draft_token_ids.shape[0]
-                    draft_ids_list = draft_token_ids[:num_reqs].cpu().tolist()
+                    assert self.draft_token_ids_event is not None
+                    assert self.draft_token_ids_cpu is not None
+                    self.draft_token_ids_event.synchronize()
+                    num_reqs = getattr(
+                        self,
+                        "_draft_token_ids_cpu_num_reqs",
+                        draft_token_ids.shape[0],
+                    )
+                    draft_ids_list = self.draft_token_ids_cpu[
+                        :num_reqs
+                    ].tolist()
                     draft_req_ids = self._draft_token_req_ids
                 else:
                     draft_ids_list = draft_token_ids
