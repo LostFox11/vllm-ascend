@@ -255,14 +255,35 @@ def _filter_unowned_layer_weights(
     self: "MiniMaxM2Model",
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterable[tuple[str, torch.Tensor]]:
+    weights = list(weights)
     param_names = set(dict(self.named_parameters()))
+    local_layer_indices = {
+        int(param_name.split(".", 2)[1])
+        for param_name in param_names
+        if param_name.startswith("layers.") and param_name.split(".", 2)[1].isdigit()
+    }
+    incoming_layer_indices = {
+        int(name.removeprefix("model.").split(".", 2)[1])
+        for name, _ in weights
+        if name.removeprefix("model.").startswith("layers.")
+        and len(name.removeprefix("model.").split(".", 2)) >= 3
+        and name.removeprefix("model.").split(".", 2)[1].isdigit()
+    }
+
+    layer_offset = 0
+    if local_layer_indices and incoming_layer_indices and local_layer_indices.isdisjoint(incoming_layer_indices):
+        layer_offset = min(incoming_layer_indices) - min(local_layer_indices)
 
     for name, loaded_weight in weights:
         local_name = name.removeprefix("model.")
         name_parts = local_name.split(".", 2)
         if len(name_parts) >= 3 and name_parts[0] == "layers" and name_parts[1].isdigit():
-            layer_prefix = f"layers.{name_parts[1]}."
-            if not any(param_name.startswith(layer_prefix) for param_name in param_names):
+            layer_idx = int(name_parts[1])
+            local_layer_idx = layer_idx - layer_offset
+            layer_prefix = f"layers.{local_layer_idx}."
+            if local_layer_idx != layer_idx and any(param_name.startswith(layer_prefix) for param_name in param_names):
+                local_name = f"layers.{local_layer_idx}.{name_parts[2]}"
+            elif not any(param_name.startswith(f"layers.{layer_idx}.") for param_name in param_names):
                 continue
             name = local_name
         yield name, loaded_weight
