@@ -281,6 +281,58 @@ class AscendEagleSpeculator(EagleSpeculator):
         self._ascend_update_seq_lens(attn_metadata)
         return last_hidden_states, hidden_states
 
+    def _prefill(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+    ) -> None:
+        debug_count = getattr(self, "_ascend_eagle3_runtime_prefill_debug_count", 0)
+        should_log_debug = (
+            self.method == "eagle3"
+            and cudagraph_runtime_mode == CUDAGraphMode.NONE
+            and debug_count < 20
+            and num_tokens < 8192
+        )
+        if should_log_debug:
+            self._ascend_eagle3_runtime_prefill_debug_count = debug_count + 1
+            logger.warning(
+                "EAGLE3 runtime draft prefill input: num_reqs=%s num_tokens=%s "
+                "input_ids=%s positions=%s seq_lens=%s query_start_loc=%s "
+                "last_token_indices=%s current_draft_step=%s hidden_shape=%s",
+                num_reqs,
+                num_tokens,
+                _preview_tensor(self.input_buffers.input_ids[:num_tokens]),
+                _preview_tensor(self.input_buffers.positions[:num_tokens]),
+                _preview_tensor(self.input_buffers.seq_lens[:num_reqs]),
+                _preview_tensor(self.input_buffers.query_start_loc[: num_reqs + 1]),
+                _preview_tensor(self.last_token_indices[:num_reqs]),
+                _preview_tensor(self.current_draft_step),
+                tuple(self.hidden_states[:num_tokens].shape),
+            )
+        super()._prefill(
+            num_reqs,
+            num_tokens,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+            mm_inputs,
+        )
+        if should_log_debug:
+            logger.warning(
+                "EAGLE3 runtime draft prefill output: draft_first=%s "
+                "prefill_hidden=%s draft_tokens=%s next_positions=%s",
+                _preview_tensor(self.draft_tokens[:num_reqs, 0]),
+                _preview_tensor(self.hidden_states[:num_reqs]),
+                _preview_tensor(self.draft_tokens[:num_reqs]),
+                _preview_tensor(self.input_buffers.positions[:num_reqs]),
+            )
+
     def _generate_draft(
         self,
         num_reqs: int,
