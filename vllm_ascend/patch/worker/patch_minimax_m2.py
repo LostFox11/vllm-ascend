@@ -129,7 +129,7 @@ def _patched_model_forward(
     pp_group = get_pp_group()
     prev_aux_list = _extract_aux_from_intermediate(intermediate_tensors)
     debug_count = getattr(self, "_ascend_eagle3_pp_debug_count", 0)
-    should_log_debug = debug_count < 20 and positions.shape[0] < 8192
+    should_log_debug = debug_count < 80 and positions.shape[0] < 8192
     if should_log_debug:
         self._ascend_eagle3_pp_debug_count = debug_count + 1
         logger.warning(
@@ -205,8 +205,10 @@ def _patched_model_forward(
         if should_log_debug:
             logger.warning(
                 "EAGLE3 PP MiniMaxM2 forward exit intermediate: pp_rank=%s "
-                "num_aux=%s aux_shapes=%s hidden_shape=%s residual_shape=%s",
+                "positions_shape=%s num_aux=%s aux_shapes=%s hidden_shape=%s "
+                "residual_shape=%s",
                 pp_group.rank_in_group,
+                tuple(positions.shape),
                 len(aux_hidden_states),
                 [tuple(t.shape) for t in aux_hidden_states],
                 tuple(hidden_states.shape),
@@ -219,8 +221,9 @@ def _patched_model_forward(
         if should_log_debug:
             logger.warning(
                 "EAGLE3 PP MiniMaxM2 forward exit last: pp_rank=%s "
-                "num_aux=%s aux_shapes=%s hidden_shape=%s",
+                "positions_shape=%s num_aux=%s aux_shapes=%s hidden_shape=%s",
                 pp_group.rank_in_group,
+                tuple(positions.shape),
                 len(aux_hidden_states),
                 [tuple(t.shape) for t in aux_hidden_states],
                 tuple(hidden_states.shape),

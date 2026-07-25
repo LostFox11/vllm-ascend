@@ -270,6 +270,27 @@ class AscendEagleSpeculator(EagleSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Override AutoRegressiveSpeculator._run_model for Ascend NPUs."""
+        debug_count = getattr(self, "_ascend_eagle3_runtime_run_model_debug_count", 0)
+        should_log_debug = (
+            self.method == "eagle3"
+            and debug_count < 40
+            and num_tokens < 8192
+        )
+        if should_log_debug:
+            self._ascend_eagle3_runtime_run_model_debug_count = debug_count + 1
+            logger.warning(
+                "EAGLE3 runtime draft run_model input: num_tokens=%s cg_mode=%s "
+                "current_draft_step=%s input_ids=%s positions=%s seq_lens=%s "
+                "query_start_loc=%s hidden_shape=%s",
+                num_tokens,
+                cudagraph_runtime_mode,
+                _preview_tensor(self.current_draft_step),
+                _preview_tensor(self.input_buffers.input_ids[:num_tokens]),
+                _preview_tensor(self.input_buffers.positions[:num_tokens]),
+                _preview_tensor(self.input_buffers.seq_lens[: min(num_tokens, self.max_num_reqs)]),
+                _preview_tensor(self.input_buffers.query_start_loc[: min(num_tokens + 1, self.max_num_reqs + 1)]),
+                tuple(self.hidden_states[:num_tokens].shape),
+            )
         last_hidden_states, hidden_states = super()._run_model(
             num_tokens,
             attn_metadata,
@@ -279,6 +300,15 @@ class AscendEagleSpeculator(EagleSpeculator):
             mm_inputs,
         )
         self._ascend_update_seq_lens(attn_metadata)
+        if should_log_debug:
+            logger.warning(
+                "EAGLE3 runtime draft run_model output: last_hidden_shape=%s "
+                "hidden_shape=%s last_hidden=%s hidden=%s",
+                tuple(last_hidden_states.shape),
+                tuple(hidden_states.shape),
+                _preview_tensor(last_hidden_states),
+                _preview_tensor(hidden_states),
+            )
         return last_hidden_states, hidden_states
 
     def _prefill(
@@ -294,7 +324,6 @@ class AscendEagleSpeculator(EagleSpeculator):
         debug_count = getattr(self, "_ascend_eagle3_runtime_prefill_debug_count", 0)
         should_log_debug = (
             self.method == "eagle3"
-            and cudagraph_runtime_mode == CUDAGraphMode.NONE
             and debug_count < 20
             and num_tokens < 8192
         )
@@ -302,10 +331,11 @@ class AscendEagleSpeculator(EagleSpeculator):
             self._ascend_eagle3_runtime_prefill_debug_count = debug_count + 1
             logger.warning(
                 "EAGLE3 runtime draft prefill input: num_reqs=%s num_tokens=%s "
-                "input_ids=%s positions=%s seq_lens=%s query_start_loc=%s "
+                "cg_mode=%s input_ids=%s positions=%s seq_lens=%s query_start_loc=%s "
                 "last_token_indices=%s current_draft_step=%s hidden_shape=%s",
                 num_reqs,
                 num_tokens,
+                cudagraph_runtime_mode,
                 _preview_tensor(self.input_buffers.input_ids[:num_tokens]),
                 _preview_tensor(self.input_buffers.positions[:num_tokens]),
                 _preview_tensor(self.input_buffers.seq_lens[:num_reqs]),
