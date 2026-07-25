@@ -55,6 +55,49 @@ from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
 
+def _is_eagle3_pp(vllm_config: VllmConfig) -> bool:
+    speculative_config = vllm_config.speculative_config
+    return (
+        speculative_config is not None
+        and speculative_config.method == "eagle3"
+        and vllm_config.parallel_config.pipeline_parallel_size > 1
+    )
+
+
+@contextmanager
+def _temporarily_relax_eagle3_pp_method(vllm_config: VllmConfig):
+    """Bypass the upstream GPUModelRunner MRV2 constructor guard.
+
+    Upstream raises for EAGLE3 + PP while constructing GPUModelRunner. Ascend
+    applies its own PP aux propagation patch after model loading, so we
+    temporarily present the method as EAGLE during construction and restore the
+    real EAGLE3 method immediately afterwards.
+    """
+    speculative_config = vllm_config.speculative_config
+    if not _is_eagle3_pp(vllm_config) or speculative_config is None:
+        yield
+        return
+
+    original_method = speculative_config.method
+    object.__setattr__(speculative_config, "method", "eagle")
+    try:
+        yield
+    finally:
+        object.__setattr__(speculative_config, "method", original_method)
+
+
+def _get_inner_language_model(model: torch.nn.Module) -> torch.nn.Module:
+    inner_model = model
+    if hasattr(inner_model, "get_language_model"):
+        inner_model = inner_model.get_language_model()
+    elif hasattr(inner_model, "language_model"):
+        language_model = inner_model.language_model
+        inner_model = language_model() if callable(language_model) else language_model
+    if hasattr(inner_model, "model"):
+        inner_model = inner_model.model
+    return inner_model
+
+
 class NPUModelRunner(GPUModelRunner):
     """Model runner for Ascend NPUs."""
 
@@ -71,8 +114,11 @@ class NPUModelRunner(GPUModelRunner):
         if self.ascend_config.eplb_config.dynamic_eplb:
             raise NotImplementedError("dynamic_eplb is not supported by Ascend NPU model runner v2.")
 
-        with torch_cuda_wrapper():
+        with torch_cuda_wrapper(), _temporarily_relax_eagle3_pp_method(vllm_config):
             super().__init__(vllm_config, device)
+
+        if _is_eagle3_pp(vllm_config):
+            self.use_aux_hidden_state_outputs = True
 
         # because we will override these attribute, delete these attribute to
         # make sure it's collected by python gc immediately.
@@ -138,6 +184,21 @@ class NPUModelRunner(GPUModelRunner):
         # we need to use input_batch to set forward_context in run_fullgraph.
         # so we can inherit `execute_model` method.
         self.input_batch: AscendInputBatch | None = None
+
+    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+        super().load_model(load_dummy_weights, *args, **kwargs)
+        if not _is_eagle3_pp(self.vllm_config):
+            return
+
+        inner_model = _get_inner_language_model(self.model)
+        from vllm_ascend.patch.worker.patch_eagle3_pp_aux import (
+            patch_eagle3_pp_aux_propagation,
+        )
+
+        if patch_eagle3_pp_aux_propagation(inner_model):
+            self.model.make_empty_intermediate_tensors = (
+                inner_model.make_empty_intermediate_tensors
+            )
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
