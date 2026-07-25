@@ -199,6 +199,12 @@ class NPUModelRunner(GPUModelRunner):
             self.model.make_empty_intermediate_tensors = (
                 inner_model.make_empty_intermediate_tensors
             )
+            if not self.is_first_pp_rank:
+                self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
+                    batch_size=self.max_num_tokens,
+                    dtype=self.model_config.dtype,
+                    device=self.device,
+                )
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
