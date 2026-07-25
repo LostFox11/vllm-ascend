@@ -251,28 +251,10 @@ MiniMaxM2Model._fp8_dequant_weight_iter = _fp8_dequant_weight_iter
 _original_load_weights = MiniMaxM2Model.load_weights
 
 
-def _filter_unowned_layer_weights(
-    self: "MiniMaxM2Model",
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> Iterable[tuple[str, torch.Tensor]]:
-    param_names = set(dict(self.named_parameters()))
-
-    for name, loaded_weight in weights:
-        local_name = name.removeprefix("model.")
-        name_parts = local_name.split(".", 2)
-        if len(name_parts) >= 3 and name_parts[0] == "layers" and name_parts[1].isdigit():
-            layer_prefix = f"layers.{name_parts[1]}."
-            if not any(param_name.startswith(layer_prefix) for param_name in param_names):
-                continue
-            name = local_name
-        yield name, loaded_weight
-
-
 def _patched_load_weights(
     self: "MiniMaxM2Model",
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> set[str]:
-    weights = _filter_unowned_layer_weights(self, weights)
     if self._need_dequantize_fp8_weights():
         weights = self._fp8_dequant_weight_iter(weights)
     return _original_load_weights(self, weights)
