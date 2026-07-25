@@ -26,6 +26,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
+from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -179,6 +180,11 @@ class DecodeEagleAclGraphManager(DecodeSpeculatorCudaGraphManager):
                 block_tables,
                 attn_groups,
                 kv_cache_config,
+            )
+            self.speculator.input_batch = AscendInputBatch.make_dummy(
+                num_reqs,
+                num_tokens,
+                input_buffers,
             )
             fwd = lambda cg_mode: forward_fn(
                 num_reqs,
