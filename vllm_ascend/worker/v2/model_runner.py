@@ -18,6 +18,7 @@
 #
 
 from contextlib import contextmanager
+import logging
 
 import numpy as np
 import torch
@@ -53,6 +54,8 @@ from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
+
+logger = logging.getLogger(__name__)
 
 
 def _is_eagle3_pp(vllm_config: VllmConfig) -> bool:
@@ -96,6 +99,20 @@ def _get_inner_language_model(model: torch.nn.Module) -> torch.nn.Module:
     if hasattr(inner_model, "model"):
         inner_model = inner_model.model
     return inner_model
+
+
+def _preview_tensor(tensor: torch.Tensor | None, rows: int = 4, cols: int = 8):
+    if tensor is None:
+        return None
+    try:
+        preview = tensor.detach()
+        if preview.dim() == 0:
+            return preview.cpu().item()
+        if preview.dim() == 1:
+            return preview[:rows].cpu().tolist()
+        return preview[:rows, :cols].cpu().tolist()
+    except Exception as e:
+        return f"<preview failed: {e}>"
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -431,6 +448,40 @@ class NPUModelRunner(GPUModelRunner):
         update_cos_sin(self.input_batch.positions)
 
         return self.input_batch
+
+    def sample(self, hidden_states, input_batch, grammar_output):
+        sampler_output, num_sampled, num_rejected = super().sample(
+            hidden_states,
+            input_batch,
+            grammar_output,
+        )
+        debug_count = getattr(self, "_ascend_eagle3_runtime_sample_debug_count", 0)
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            speculative_config is not None
+            and speculative_config.method == "eagle3"
+            and debug_count < 20
+            and input_batch.num_tokens_after_padding < 8192
+        ):
+            self._ascend_eagle3_runtime_sample_debug_count = debug_count + 1
+            logger.warning(
+                "EAGLE3 runtime target sample: num_reqs=%s num_tokens=%s "
+                "num_draft_tokens=%s sampled_shape=%s sampled=%s "
+                "num_sampled=%s num_rejected=%s input_ids=%s positions=%s "
+                "idx_mapping=%s logits_indices=%s",
+                input_batch.num_reqs,
+                input_batch.num_tokens_after_padding,
+                input_batch.num_draft_tokens,
+                tuple(sampler_output.sampled_token_ids.shape),
+                _preview_tensor(sampler_output.sampled_token_ids),
+                _preview_tensor(num_sampled),
+                _preview_tensor(num_rejected),
+                _preview_tensor(input_batch.input_ids),
+                _preview_tensor(input_batch.positions),
+                _preview_tensor(input_batch.idx_mapping),
+                _preview_tensor(input_batch.logits_indices),
+            )
+        return sampler_output, num_sampled, num_rejected
 
     def postprocess(
         self,

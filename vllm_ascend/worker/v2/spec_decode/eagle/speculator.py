@@ -40,6 +40,20 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
 logger = logging.getLogger(__name__)
 
 
+def _preview_tensor(tensor: torch.Tensor | None, rows: int = 4, cols: int = 8):
+    if tensor is None:
+        return None
+    try:
+        preview = tensor.detach()
+        if preview.dim() == 0:
+            return preview.cpu().item()
+        if preview.dim() == 1:
+            return preview[:rows].cpu().tolist()
+        return preview[:rows, :cols].cpu().tolist()
+    except Exception as e:
+        return f"<preview failed: {e}>"
+
+
 class AscendEagleSpeculator(EagleSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         """Override GPU EagleSpeculator.__init__ for Ascend NPUs.
@@ -115,15 +129,25 @@ class AscendEagleSpeculator(EagleSpeculator):
         generate_draft.
         """
         self.input_batch = input_batch
-        debug_count = getattr(self, "_ascend_eagle3_pp_debug_count", 0)
-        if self.method == "eagle3" and debug_count < 20:
-            self._ascend_eagle3_pp_debug_count = debug_count + 1
+        debug_count = getattr(self, "_ascend_eagle3_runtime_debug_count", 0)
+        should_log_debug = (
+            self.method == "eagle3"
+            and not dummy_run
+            and not bool(is_profile)
+            and debug_count < 20
+        )
+        if should_log_debug:
+            self._ascend_eagle3_runtime_debug_count = debug_count + 1
             draft_inner_model = getattr(self.model, "model", None)
+            idx_preview = input_batch.idx_mapping[: input_batch.num_reqs]
+            last_sampled_preview = last_sampled[idx_preview]
+            next_prefill_preview = next_prefill_tokens[idx_preview]
             logger.warning(
-                "EAGLE3 PP propose enter: num_reqs=%s num_tokens=%s "
+                "EAGLE3 runtime propose enter: num_reqs=%s num_tokens=%s "
                 "last_hidden_shape=%s aux_count=%s aux_shapes=%s "
                 "draft_use_aux=%s draft_num_aux=%s draft_fc_input_size=%s "
-                "num_sampled_shape=%s num_rejected_shape=%s",
+                "num_sampled=%s num_rejected=%s last_sampled=%s "
+                "next_prefill=%s input_ids=%s positions=%s",
                 input_batch.num_reqs,
                 input_batch.num_tokens_after_padding,
                 tuple(last_hidden_states.shape),
@@ -132,13 +156,17 @@ class AscendEagleSpeculator(EagleSpeculator):
                 getattr(draft_inner_model, "use_aux_hidden_state", None),
                 getattr(draft_inner_model, "num_aux_layers", None),
                 getattr(draft_inner_model, "fc_input_size", None),
-                tuple(num_sampled.shape),
-                tuple(num_rejected.shape),
+                _preview_tensor(num_sampled),
+                _preview_tensor(num_rejected),
+                _preview_tensor(last_sampled_preview),
+                _preview_tensor(next_prefill_preview),
+                _preview_tensor(input_batch.input_ids),
+                _preview_tensor(input_batch.positions),
             )
         # wrap build_attn_metadata to use Ascend attention metadata building.
         # so we can call super().propose() directly.
         with build_attn_metadata_wrapper(), torch_gather_wrapper():
-            return super().propose(
+            draft_tokens = super().propose(
                 input_batch,
                 attn_metadata,
                 slot_mappings,
@@ -156,6 +184,15 @@ class AscendEagleSpeculator(EagleSpeculator):
                 mm_inputs,
                 is_profile=is_profile,
             )
+        if should_log_debug:
+            logger.warning(
+                "EAGLE3 runtime propose exit: draft_tokens_shape=%s "
+                "draft_tokens=%s first_step=%s",
+                tuple(draft_tokens.shape),
+                _preview_tensor(draft_tokens),
+                _preview_tensor(draft_tokens[:, 0] if draft_tokens.dim() > 1 else draft_tokens),
+            )
+        return draft_tokens
 
     def set_attn(
         self,
