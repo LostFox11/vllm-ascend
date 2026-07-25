@@ -87,6 +87,7 @@ class AscendEagleSpeculator(EagleSpeculator):
         # when in decode phase of eagle speculator, we need some value in
         # draft model's input_batch. so we keep a reference here.
         self.input_batch: InputBatch | None = None
+        self._debug_eagle3_propose_id = 0
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         super().init_cudagraph_manager(cudagraph_mode)
@@ -135,17 +136,21 @@ class AscendEagleSpeculator(EagleSpeculator):
             and not bool(is_profile)
             and input_batch.num_tokens_after_padding < 8192
         )
+        debug_propose_id = 0
         if should_log_debug:
+            self._debug_eagle3_propose_id += 1
+            debug_propose_id = self._debug_eagle3_propose_id
             draft_inner_model = getattr(self.model, "model", None)
             idx_preview = input_batch.idx_mapping[: input_batch.num_reqs]
             last_sampled_preview = last_sampled[idx_preview]
             next_prefill_preview = next_prefill_tokens[idx_preview]
             logger.warning(
-                "EAGLE3 runtime propose enter: num_reqs=%s num_tokens=%s "
+                "EAGLE3 runtime propose enter[%s]: num_reqs=%s num_tokens=%s "
                 "last_hidden_shape=%s aux_count=%s aux_shapes=%s "
                 "draft_use_aux=%s draft_num_aux=%s draft_fc_input_size=%s "
                 "num_sampled=%s num_rejected=%s last_sampled=%s "
                 "next_prefill=%s input_ids=%s positions=%s",
+                debug_propose_id,
                 input_batch.num_reqs,
                 input_batch.num_tokens_after_padding,
                 tuple(last_hidden_states.shape),
@@ -184,8 +189,9 @@ class AscendEagleSpeculator(EagleSpeculator):
             )
         if should_log_debug:
             logger.warning(
-                "EAGLE3 runtime propose exit: draft_tokens_shape=%s "
+                "EAGLE3 runtime propose exit[%s]: draft_tokens_shape=%s "
                 "draft_tokens=%s first_step=%s",
+                debug_propose_id,
                 tuple(draft_tokens.shape),
                 _preview_tensor(draft_tokens),
                 _preview_tensor(draft_tokens[:, 0] if draft_tokens.dim() > 1 else draft_tokens),
@@ -274,9 +280,10 @@ class AscendEagleSpeculator(EagleSpeculator):
         )
         if should_log_debug:
             logger.warning(
-                "EAGLE3 runtime draft run_model input: num_tokens=%s cg_mode=%s "
+                "EAGLE3 runtime draft run_model input[%s]: num_tokens=%s cg_mode=%s "
                 "current_draft_step=%s input_ids=%s positions=%s seq_lens=%s "
                 "query_start_loc=%s hidden_shape=%s",
+                self._debug_eagle3_propose_id,
                 num_tokens,
                 cudagraph_runtime_mode,
                 _preview_tensor(self.current_draft_step),
@@ -297,8 +304,9 @@ class AscendEagleSpeculator(EagleSpeculator):
         self._ascend_update_seq_lens(attn_metadata)
         if should_log_debug:
             logger.warning(
-                "EAGLE3 runtime draft run_model output: last_hidden_shape=%s "
+                "EAGLE3 runtime draft run_model output[%s]: last_hidden_shape=%s "
                 "hidden_shape=%s last_hidden=%s hidden=%s",
+                self._debug_eagle3_propose_id,
                 tuple(last_hidden_states.shape),
                 tuple(hidden_states.shape),
                 _preview_tensor(last_hidden_states),
@@ -322,9 +330,10 @@ class AscendEagleSpeculator(EagleSpeculator):
         )
         if should_log_debug:
             logger.warning(
-                "EAGLE3 runtime draft prefill input: num_reqs=%s num_tokens=%s "
+                "EAGLE3 runtime draft prefill input[%s]: num_reqs=%s num_tokens=%s "
                 "cg_mode=%s input_ids=%s positions=%s seq_lens=%s query_start_loc=%s "
                 "last_token_indices=%s current_draft_step=%s hidden_shape=%s",
+                self._debug_eagle3_propose_id,
                 num_reqs,
                 num_tokens,
                 cudagraph_runtime_mode,
@@ -347,8 +356,9 @@ class AscendEagleSpeculator(EagleSpeculator):
         )
         if should_log_debug:
             logger.warning(
-                "EAGLE3 runtime draft prefill output: draft_first=%s "
+                "EAGLE3 runtime draft prefill output[%s]: draft_first=%s "
                 "prefill_hidden=%s draft_tokens=%s next_positions=%s",
+                self._debug_eagle3_propose_id,
                 _preview_tensor(self.draft_tokens[:num_reqs, 0]),
                 _preview_tensor(self.hidden_states[:num_reqs]),
                 _preview_tensor(self.draft_tokens[:num_reqs]),

@@ -306,16 +306,17 @@ class NPUModelRunner(GPUModelRunner):
                 dtype=np.int32,
             )
             num_draft_tokens_per_req = num_draft_tokens_arr
+            num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
             total_num_draft_tokens = int(num_draft_tokens_arr.sum())
-            total_num_logits = num_reqs + total_num_draft_tokens
+            total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
 
-            num_logits = num_draft_tokens_arr + 1
+            num_logits = num_draft_tokens_arr + num_bonus_tokens
             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
             cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
 
-            max_expand_len = self.num_speculative_steps + 1
+            max_expand_len = self.decode_query_len
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, max_expand_len
             )
@@ -387,6 +388,7 @@ class NPUModelRunner(GPUModelRunner):
             self.req_states.draft_tokens,
             cu_num_logits,
             total_num_logits,
+            self.model_state.num_new_sampled_tokens_per_step,
         )
 
         input_ids = self.input_buffers.input_ids[:num_tokens_after_padding]
@@ -461,11 +463,14 @@ class NPUModelRunner(GPUModelRunner):
             and speculative_config.method == "eagle3"
             and input_batch.num_tokens_after_padding < 8192
         ):
+            debug_sample_id = getattr(self, "_debug_eagle3_sample_id", 0) + 1
+            self._debug_eagle3_sample_id = debug_sample_id
             logger.warning(
-                "EAGLE3 runtime target sample: num_reqs=%s num_tokens=%s "
+                "EAGLE3 runtime target sample[%s]: num_reqs=%s num_tokens=%s "
                 "num_draft_tokens=%s sampled_shape=%s sampled=%s "
                 "num_sampled=%s num_rejected=%s input_ids=%s positions=%s "
-                "idx_mapping=%s logits_indices=%s",
+                "idx_mapping=%s logits_indices=%s num_new_sampled_per_step=%s",
+                debug_sample_id,
                 input_batch.num_reqs,
                 input_batch.num_tokens_after_padding,
                 input_batch.num_draft_tokens,
@@ -477,6 +482,7 @@ class NPUModelRunner(GPUModelRunner):
                 _preview_tensor(input_batch.positions),
                 _preview_tensor(input_batch.idx_mapping),
                 _preview_tensor(input_batch.logits_indices),
+                self.model_state.num_new_sampled_tokens_per_step,
             )
         return sampler_output, num_sampled, num_rejected
 
