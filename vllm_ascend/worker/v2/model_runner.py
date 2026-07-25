@@ -455,15 +455,12 @@ class NPUModelRunner(GPUModelRunner):
             input_batch,
             grammar_output,
         )
-        debug_count = getattr(self, "_ascend_eagle3_runtime_sample_debug_count", 0)
         speculative_config = self.vllm_config.speculative_config
         if (
             speculative_config is not None
             and speculative_config.method == "eagle3"
-            and debug_count < 20
             and input_batch.num_tokens_after_padding < 8192
         ):
-            self._ascend_eagle3_runtime_sample_debug_count = debug_count + 1
             logger.warning(
                 "EAGLE3 runtime target sample: num_reqs=%s num_tokens=%s "
                 "num_draft_tokens=%s sampled_shape=%s sampled=%s "

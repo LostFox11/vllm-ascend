@@ -129,15 +129,13 @@ class AscendEagleSpeculator(EagleSpeculator):
         generate_draft.
         """
         self.input_batch = input_batch
-        debug_count = getattr(self, "_ascend_eagle3_runtime_debug_count", 0)
         should_log_debug = (
             self.method == "eagle3"
             and not dummy_run
             and not bool(is_profile)
-            and debug_count < 20
+            and input_batch.num_tokens_after_padding < 8192
         )
         if should_log_debug:
-            self._ascend_eagle3_runtime_debug_count = debug_count + 1
             draft_inner_model = getattr(self.model, "model", None)
             idx_preview = input_batch.idx_mapping[: input_batch.num_reqs]
             last_sampled_preview = last_sampled[idx_preview]
@@ -270,14 +268,11 @@ class AscendEagleSpeculator(EagleSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Override AutoRegressiveSpeculator._run_model for Ascend NPUs."""
-        debug_count = getattr(self, "_ascend_eagle3_runtime_run_model_debug_count", 0)
         should_log_debug = (
             self.method == "eagle3"
-            and debug_count < 40
             and num_tokens < 8192
         )
         if should_log_debug:
-            self._ascend_eagle3_runtime_run_model_debug_count = debug_count + 1
             logger.warning(
                 "EAGLE3 runtime draft run_model input: num_tokens=%s cg_mode=%s "
                 "current_draft_step=%s input_ids=%s positions=%s seq_lens=%s "
@@ -321,14 +316,11 @@ class AscendEagleSpeculator(EagleSpeculator):
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
-        debug_count = getattr(self, "_ascend_eagle3_runtime_prefill_debug_count", 0)
         should_log_debug = (
             self.method == "eagle3"
-            and debug_count < 20
             and num_tokens < 8192
         )
         if should_log_debug:
-            self._ascend_eagle3_runtime_prefill_debug_count = debug_count + 1
             logger.warning(
                 "EAGLE3 runtime draft prefill input: num_reqs=%s num_tokens=%s "
                 "cg_mode=%s input_ids=%s positions=%s seq_lens=%s query_start_loc=%s "

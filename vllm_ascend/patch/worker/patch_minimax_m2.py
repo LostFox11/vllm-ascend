@@ -128,10 +128,8 @@ def _patched_model_forward(
 ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
     pp_group = get_pp_group()
     prev_aux_list = _extract_aux_from_intermediate(intermediate_tensors)
-    debug_count = getattr(self, "_ascend_eagle3_pp_debug_count", 0)
-    should_log_debug = debug_count < 80 and positions.shape[0] < 8192
+    should_log_debug = positions.shape[0] < 8192
     if should_log_debug:
-        self._ascend_eagle3_pp_debug_count = debug_count + 1
         logger.warning(
             "EAGLE3 PP MiniMaxM2 forward enter: pp_rank=%s first=%s last=%s "
             "start_layer=%s end_layer=%s aux_layers=%s incoming_aux=%s "
