@@ -19,6 +19,7 @@
 
 from collections.abc import Iterable
 from itertools import islice
+import logging
 
 import torch
 from vllm.distributed.parallel_state import get_pp_group
@@ -33,6 +34,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_slice
 
 _AUX_KEY_PREFIX = "aux_layer_"
+logger = logging.getLogger(__name__)
 
 FP8_DTYPES = tuple(
     getattr(torch, dtype_name)
@@ -126,6 +128,24 @@ def _patched_model_forward(
 ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
     pp_group = get_pp_group()
     prev_aux_list = _extract_aux_from_intermediate(intermediate_tensors)
+    debug_count = getattr(self, "_ascend_eagle3_pp_debug_count", 0)
+    should_log_debug = debug_count < 20
+    if should_log_debug:
+        self._ascend_eagle3_pp_debug_count = debug_count + 1
+        logger.warning(
+            "EAGLE3 PP MiniMaxM2 forward enter: pp_rank=%s first=%s last=%s "
+            "start_layer=%s end_layer=%s aux_layers=%s incoming_aux=%s "
+            "incoming_shapes=%s positions_shape=%s",
+            pp_group.rank_in_group,
+            pp_group.is_first_rank,
+            pp_group.is_last_rank,
+            self.start_layer,
+            self.end_layer,
+            getattr(self, "aux_hidden_state_layers", None),
+            len(prev_aux_list),
+            [tuple(t.shape) for t in prev_aux_list],
+            tuple(positions.shape),
+        )
 
     if pp_group.is_first_rank:
         if inputs_embeds is not None:
@@ -144,17 +164,37 @@ def _patched_model_forward(
         hidden_states,
         residual,
     )
+    if should_log_debug and len(aux_hidden_states) > len(prev_aux_list):
+        logger.warning(
+            "EAGLE3 PP MiniMaxM2 aux collect: pp_rank=%s layer_id=0 "
+            "shape=%s residual=%s total_aux=%s",
+            pp_group.rank_in_group,
+            tuple(aux_hidden_states[-1].shape),
+            residual is not None,
+            len(aux_hidden_states),
+        )
     for idx, layer in enumerate(
         islice(self.layers, self.start_layer, self.end_layer),
         start=self.start_layer,
     ):
         hidden_states, residual = layer(positions, hidden_states, residual)
+        before_aux_count = len(aux_hidden_states)
         self._maybe_add_hidden_state(
             aux_hidden_states,
             idx + 1,
             hidden_states,
             residual,
         )
+        if should_log_debug and len(aux_hidden_states) > before_aux_count:
+            logger.warning(
+                "EAGLE3 PP MiniMaxM2 aux collect: pp_rank=%s layer_id=%s "
+                "shape=%s residual=%s total_aux=%s",
+                pp_group.rank_in_group,
+                idx + 1,
+                tuple(aux_hidden_states[-1].shape),
+                residual is not None,
+                len(aux_hidden_states),
+            )
 
     if not pp_group.is_last_rank:
         result = IntermediateTensors(
@@ -162,12 +202,39 @@ def _patched_model_forward(
         )
         for i, tensor in enumerate(aux_hidden_states):
             result.tensors[f"{_AUX_KEY_PREFIX}{i}"] = tensor
+        if should_log_debug:
+            logger.warning(
+                "EAGLE3 PP MiniMaxM2 forward exit intermediate: pp_rank=%s "
+                "num_aux=%s aux_shapes=%s hidden_shape=%s residual_shape=%s",
+                pp_group.rank_in_group,
+                len(aux_hidden_states),
+                [tuple(t.shape) for t in aux_hidden_states],
+                tuple(hidden_states.shape),
+                None if residual is None else tuple(residual.shape),
+            )
         return result
 
     hidden_states, _ = self.norm(hidden_states, residual)
     if len(aux_hidden_states) > 0:
+        if should_log_debug:
+            logger.warning(
+                "EAGLE3 PP MiniMaxM2 forward exit last: pp_rank=%s "
+                "num_aux=%s aux_shapes=%s hidden_shape=%s",
+                pp_group.rank_in_group,
+                len(aux_hidden_states),
+                [tuple(t.shape) for t in aux_hidden_states],
+                tuple(hidden_states.shape),
+            )
         return hidden_states, aux_hidden_states
 
+    if should_log_debug:
+        logger.warning(
+            "EAGLE3 PP MiniMaxM2 forward exit last without aux: pp_rank=%s "
+            "hidden_shape=%s aux_layers=%s",
+            pp_group.rank_in_group,
+            tuple(hidden_states.shape),
+            getattr(self, "aux_hidden_state_layers", None),
+        )
     return hidden_states
 
 

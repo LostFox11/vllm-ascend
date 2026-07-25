@@ -115,6 +115,26 @@ class AscendEagleSpeculator(EagleSpeculator):
         generate_draft.
         """
         self.input_batch = input_batch
+        debug_count = getattr(self, "_ascend_eagle3_pp_debug_count", 0)
+        if self.method == "eagle3" and debug_count < 20:
+            self._ascend_eagle3_pp_debug_count = debug_count + 1
+            draft_inner_model = getattr(self.model, "model", None)
+            logger.warning(
+                "EAGLE3 PP propose enter: num_reqs=%s num_tokens=%s "
+                "last_hidden_shape=%s aux_count=%s aux_shapes=%s "
+                "draft_use_aux=%s draft_num_aux=%s draft_fc_input_size=%s "
+                "num_sampled_shape=%s num_rejected_shape=%s",
+                input_batch.num_reqs,
+                input_batch.num_tokens_after_padding,
+                tuple(last_hidden_states.shape),
+                0 if aux_hidden_states is None else len(aux_hidden_states),
+                None if aux_hidden_states is None else [tuple(t.shape) for t in aux_hidden_states],
+                getattr(draft_inner_model, "use_aux_hidden_state", None),
+                getattr(draft_inner_model, "num_aux_layers", None),
+                getattr(draft_inner_model, "fc_input_size", None),
+                tuple(num_sampled.shape),
+                tuple(num_rejected.shape),
+            )
         # wrap build_attn_metadata to use Ascend attention metadata building.
         # so we can call super().propose() directly.
         with build_attn_metadata_wrapper(), torch_gather_wrapper():
