@@ -19,6 +19,7 @@
 
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from math import prod
 from typing import Any
 
@@ -72,18 +73,22 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 head_size = spec.head_size
                 dtype = spec.dtype
                 cache_dtype_str = spec.cache_dtype_str
-            kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+            spec = AscendMLAAttentionSpec(
                 block_size=spec.block_size,
                 num_kv_heads=spec.num_kv_heads,
                 head_size=head_size,
                 dtype=dtype,
                 cache_dtype_str=cache_dtype_str,
             )
-        else:
-            # Preserve non-MLA specs from all AttentionLayerBase subclasses.
-            # In particular, GDN/Mamba layers return MambaSpec and must be
-            # present in kv_cache_config so their per-layer metadata is built.
-            kv_cache_spec[layer_name] = spec
+        # Preserve non-MLA specs from all AttentionLayerBase subclasses.
+        # In particular, GDN/Mamba layers return MambaSpec and must be
+        # present in kv_cache_config so their per-layer metadata is built.
+        if isinstance(spec, AttentionSpec):
+            # MRv2 stores Ascend attention K/V as separate num-blocks-first
+            # views. The reshape path below removes any hybrid page padding
+            # before exposing those views to the backend.
+            spec = replace(spec, indexes_kv_by_block_stride=True)
+        kv_cache_spec[layer_name] = spec
 
     return kv_cache_spec
 
@@ -321,14 +326,21 @@ def _allocate_kv_cache(
         k_dim, v_dim = _get_attention_kv_cache_dims(example_layer_name, example_kv_cache_spec)
         assert k_dim > 0 and v_dim > 0
         kv_head_dim_list = [k_dim, v_dim]
+        tensor_size = kv_cache_tensor.size
+        if example_kv_cache_spec.page_size_padded is not None:
+            assert tensor_size % example_kv_cache_spec.page_size_bytes == 0
+            num_blocks = tensor_size // example_kv_cache_spec.page_size_bytes
+            tensor_size = (
+                num_blocks * example_kv_cache_spec.real_page_size_bytes
+            )
         if enable_fa_quant(vllm_config):
             k_tensor_split_factor, v_tensor_split_factor = vllm_config.quant_config.get_kv_quant_split_factor(
                 example_layer_name, kv_head_dim_list
             )
         else:
             k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
-        k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
-        v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
+        k_tensor_size = int(tensor_size // k_tensor_split_factor)
+        v_tensor_size = int(tensor_size // v_tensor_split_factor)
 
         if vllm_config.kv_transfer_config is None:
             k_tensor = torch.zeros(k_tensor_size, dtype=torch.int8, device=device)

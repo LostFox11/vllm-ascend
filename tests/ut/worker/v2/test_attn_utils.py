@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import torch
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
@@ -17,23 +18,38 @@ from vllm_ascend.worker.v2 import attn_utils
 
 def test_get_kv_cache_spec_preserves_non_mla_attention_layers(monkeypatch):
     vllm_config = Mock()
-    gdn_spec = Mock()
+    gdn_spec = MambaSpec(
+        block_size=16,
+        shapes=((2,), (3,)),
+        dtypes=(torch.float32, torch.float32),
+    )
+    attention_spec = AttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+    )
     gdn_layer = Mock()
     gdn_layer.kv_sharing_target_layer_name = None
     gdn_layer.get_kv_cache_spec.return_value = gdn_spec
+    attention_layer = Mock()
+    attention_layer.kv_sharing_target_layer_name = None
+    attention_layer.get_kv_cache_spec.return_value = attention_spec
     monkeypatch.setattr(
         attn_utils,
         "get_layers_from_vllm_config",
         lambda *_args, **_kwargs: {
-            "language_model.model.layers.0.linear_attn": gdn_layer
+            "language_model.model.layers.0.linear_attn": gdn_layer,
+            "language_model.model.layers.3.self_attn.attn": attention_layer,
         },
     )
 
     specs = attn_utils.get_kv_cache_spec(vllm_config)
 
-    assert specs == {
-        "language_model.model.layers.0.linear_attn": gdn_spec,
-    }
+    assert specs["language_model.model.layers.0.linear_attn"] == gdn_spec
+    assert specs[
+        "language_model.model.layers.3.self_attn.attn"
+    ].indexes_kv_by_block_stride
 
 
 def test_mamba_kv_cache_allocation_and_reshape(monkeypatch):
@@ -89,3 +105,50 @@ def test_mamba_kv_cache_allocation_and_reshape(monkeypatch):
         (num_blocks, 2),
         (num_blocks, 3),
     ]
+
+
+def test_attention_allocation_excludes_hybrid_page_padding(monkeypatch):
+    layer_name = "language_model.model.layers.3.self_attn.attn"
+    num_blocks = 2
+    attention_spec = AttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+        page_size_padded=1280,
+        indexes_kv_by_block_stride=True,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=attention_spec.page_size_bytes * num_blocks,
+                shared_by=[layer_name],
+            )
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=[layer_name],
+                kv_cache_spec=attention_spec,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        attn_utils,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(kv_transfer_config=None),
+    )
+    monkeypatch.setattr(attn_utils, "enable_fa_quant", lambda _config: False)
+
+    raw_caches = attn_utils._allocate_kv_cache(
+        kv_cache_config,
+        shared_layers={},
+        device=torch.device("cpu"),
+    )
+
+    raw_cache = raw_caches[layer_name]
+    assert isinstance(raw_cache, tuple)
+    k_cache, v_cache = raw_cache
+    assert k_cache.numel() + v_cache.numel() == (
+        attention_spec.real_page_size_bytes * num_blocks
+    )
