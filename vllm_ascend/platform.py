@@ -704,6 +704,16 @@ class NPUPlatform(Platform):
                     "vllm_ascend.core.batch_job_aware_scheduler.BatchJobAwareScheduler"
                 )
 
+        if (
+            parallel_config.pipeline_parallel_size > 1
+            and vllm_config.use_v2_model_runner
+            and vllm_config.scheduler_config.async_scheduling
+            and vllm_config.scheduler_config.scheduler_cls is None
+        ):
+            vllm_config.scheduler_config.scheduler_cls = (
+                "vllm_ascend.core.pp_batch_scheduler.PPBatchAsyncScheduler"
+            )
+
         cp_size = parallel_config.prefill_context_parallel_size * parallel_config.decode_context_parallel_size
         use_sparse = model_uses_sfa_sparse(model_config)
         sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(vllm_config)

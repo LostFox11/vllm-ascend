@@ -793,6 +793,35 @@ class TestNPUPlatform(TestBase):
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
     @patch("vllm_ascend.ascend_config.init_ascend_config")
+    def test_check_and_update_config_selects_pp_batch_scheduler(
+        self, mock_init_ascend, mock_soc_version, mock_auto_detect
+    ):
+        from vllm_ascend import platform
+
+        importlib.reload(platform)
+        self.platform = platform.NPUPlatform()
+
+        mock_init_ascend.return_value = TestNPUPlatform.mock_vllm_ascend_config()
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.parallel_config.pipeline_parallel_size = 2
+        vllm_config.use_v2_model_runner = True
+        vllm_config.scheduler_config.async_scheduling = True
+        vllm_config.kv_transfer_config = None
+
+        with (
+            patch.object(platform.NPUPlatform, "_fix_incompatible_config"),
+            patch.object(platform, "check_kv_extra_config"),
+        ):
+            self.platform.check_and_update_config(vllm_config)
+
+        self.assertEqual(
+            vllm_config.scheduler_config.scheduler_cls,
+            "vllm_ascend.core.pp_batch_scheduler.PPBatchAsyncScheduler",
+        )
+
+    @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
+    @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
+    @patch("vllm_ascend.ascend_config.init_ascend_config")
     @patch("vllm_ascend.core.recompute_scheduler.RecomputeSchedulerConfig.initialize_from_config")
     def test_check_and_update_config_short_request_first_survives_p_recompute_disable(
         self, mock_init_recompute, mock_init_ascend, mock_soc_version, mock_auto_detect
