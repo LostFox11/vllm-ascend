@@ -35,6 +35,7 @@ from vllm.v1.worker.gpu.input_batch import (
     prepare_prefill_inputs,
 )
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.utils.torch_utils import PIN_MEMORY
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
@@ -53,6 +54,7 @@ from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
+from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -142,6 +144,18 @@ class NPUModelRunner(GPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
             super().initialize_kv_cache(kv_cache_config)
+
+    def _init_kv_zero_meta(self) -> None:
+        self.kv_block_zeroer = AscendKVBlockZeroer(self.device, PIN_MEMORY)
+        self.kv_block_zeroer.init_meta(
+            attn_groups_iter=(
+                group for groups in self.attn_groups for group in groups
+            ),
+            kernel_block_sizes=self.kernel_block_sizes,
+            cache_dtype=self.cache_config.cache_dtype,
+            runner_only_attn_layers=set(),
+            static_forward_context=self.compilation_config.static_forward_context,
+        )
 
     @torch.inference_mode()
     def profile_run(self) -> None:

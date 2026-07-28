@@ -69,7 +69,7 @@ class AscendKVBlockZeroer(KVBlockZeroer):
     def init_meta(
         self,
         attn_groups_iter: Iterable["AttentionGroup"],
-        kernel_block_sizes: list[list[int]],
+        kernel_block_sizes: list[int] | list[list[int]],
         cache_dtype: str,
         runner_only_attn_layers: set[str],
         static_forward_context: dict[str, Any],
@@ -97,7 +97,9 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
-            kernel_bs = kernel_block_sizes[group.kv_cache_group_id][0]
+            kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
+            if not isinstance(kernel_bs, int):
+                kernel_bs = kernel_bs[0]
             ratio = spec.block_size // kernel_bs
             block_dim = 0
 

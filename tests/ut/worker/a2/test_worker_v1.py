@@ -1262,6 +1262,24 @@ class TestNPUWorker(TestBase):
             # Verify calls
             worker.model_runner.initialize_kv_cache.assert_called_once_with(mock_kv_cache_config)
 
+    @patch("vllm_ascend.worker.worker.ensure_kv_transfer_initialized")
+    def test_initialize_from_config_initializes_hybrid_cache_zeroer(
+        self, mock_ensure_kv_transfer
+    ):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.model_runner = MagicMock()
+            worker.vllm_config = MagicMock()
+            worker.vllm_config.model_config.enable_sleep_mode = False
+            kv_cache_config = MagicMock()
+            kv_cache_config.needs_kv_cache_zeroing = True
+
+            worker.initialize_from_config(kv_cache_config)
+
+            worker.model_runner._init_kv_zero_meta.assert_called_once_with()
+
     @patch("vllm_ascend.worker.worker.get_ascend_config")
     @patch("vllm_ascend.worker.worker.enable_sp", return_value=False)
     @patch("vllm_ascend.worker.worker.get_pp_group")
