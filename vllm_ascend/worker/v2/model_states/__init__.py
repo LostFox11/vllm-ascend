@@ -20,7 +20,12 @@
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+
+
+def _has_gdn_layer(model: nn.Module) -> bool:
+    return any(isinstance(module, GatedDeltaNetAttention) for module in model.modules())
 
 
 def init_asecnd_model_state(
@@ -29,7 +34,7 @@ def init_asecnd_model_state(
     encoder_cache: EncoderCache | None,
     device: torch.device,
 ):
-    if vllm_config.model_config.is_hybrid:
+    if vllm_config.model_config.is_hybrid or _has_gdn_layer(model):
         from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
             AscendMambaHybridModelState,
         )
