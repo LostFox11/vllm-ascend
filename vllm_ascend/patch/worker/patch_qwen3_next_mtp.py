@@ -1,4 +1,5 @@
 import torch
+import vllm.v1.worker.gpu.attn_utils as gpu_attn_utils
 import vllm.v1.worker.utils as utils
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.worker.utils import defaultdict, extract_layer_index
@@ -48,3 +49,4 @@ def bind_kv_cache(
 
 
 utils.bind_kv_cache = bind_kv_cache
+gpu_attn_utils.bind_kv_cache = bind_kv_cache
