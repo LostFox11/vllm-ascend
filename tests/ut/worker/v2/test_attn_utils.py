@@ -16,6 +16,18 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.worker.v2 import attn_utils
 
 
+class _FakeAttentionBackend:
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size,
+        _cache_dtype,
+    ):
+        return 2, num_blocks, block_size, num_kv_heads, head_size
+
+
 def test_get_kv_cache_spec_preserves_non_mla_attention_layers(monkeypatch):
     vllm_config = Mock()
     gdn_spec = MambaSpec(
@@ -152,3 +164,24 @@ def test_attention_allocation_excludes_hybrid_page_padding(monkeypatch):
     assert k_cache.numel() + v_cache.numel() == (
         attention_spec.real_page_size_bytes * num_blocks
     )
+
+    caches = attn_utils._reshape_kv_cache_v2(
+        attn_groups=[
+            SimpleNamespace(
+                kv_cache_group_id=0,
+                kv_cache_spec=attention_spec,
+                layer_names=[layer_name],
+                backend=_FakeAttentionBackend,
+            )
+        ],
+        kv_cache_raw_tensors=raw_caches,
+        cache_dtype="auto",
+        kernel_block_sizes=[attention_spec.block_size],
+        shared_kv_cache_layers={},
+        kv_cache_config=kv_cache_config,
+    )
+
+    assert [cache.shape for cache in caches[layer_name]] == [
+        (num_blocks, 16, 1, 8),
+        (num_blocks, 16, 1, 8),
+    ]

@@ -523,8 +523,13 @@ def _reshape_kv_cache_v2(
                 sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
             assert raw_k_tensor is not None
             assert raw_v_tensor is not None
-            assert sum_page_size_bytes % kv_cache_spec.page_size_bytes == 0
-            num_blocks = sum_page_size_bytes // kv_cache_spec.page_size_bytes
+            allocation_page_size = (
+                kv_cache_spec.page_size_bytes
+                if isinstance(raw_cache, torch.Tensor)
+                else kv_cache_spec.real_page_size_bytes
+            )
+            assert sum_page_size_bytes % allocation_page_size == 0
+            num_blocks = sum_page_size_bytes // allocation_page_size
 
             num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
             kernel_num_blocks = num_blocks * num_blocks_per_kv_block
