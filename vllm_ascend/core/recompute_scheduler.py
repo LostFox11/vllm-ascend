@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from typing import cast
 
@@ -145,7 +147,76 @@ class RecomputeScheduler(Scheduler):
         )
         assert finished_reqs == [(request.request_id, request.client_index)]
 
+    @staticmethod
+    def _get_pp_batch_request_limit(
+        num_requests: int,
+        pp_size: int,
+    ) -> int:
+        assert num_requests >= 0
+        assert pp_size > 0
+        return (num_requests + pp_size - 1) // pp_size
+
+    @contextmanager
+    def _limit_pp_batch_requests(self) -> Iterator[int | None]:
+        pp_size = self.parallel_config.pipeline_parallel_size
+        if pp_size <= 1 or not self.use_v2_model_runner:
+            yield None
+            return
+
+        effective_num_requests = min(
+            self.max_num_running_reqs,
+            self.get_num_unfinished_requests(),
+        )
+        batch_request_limit = self._get_pp_batch_request_limit(
+            effective_num_requests,
+            pp_size,
+        )
+
+        next_step = self.current_step + 1
+        num_eligible_running = 0
+        deferred_eligibility: list[tuple[Request, int]] = []
+        for request in self.running:
+            if request.next_decode_eligible_step > next_step:
+                continue
+            if num_eligible_running < batch_request_limit:
+                num_eligible_running += 1
+                continue
+
+            deferred_eligibility.append(
+                (request, request.next_decode_eligible_step)
+            )
+            request.next_decode_eligible_step = next_step + 1
+
+        remaining_batch_slots = max(
+            0,
+            batch_request_limit - num_eligible_running,
+        )
+        original_max_num_running_reqs = self.max_num_running_reqs
+        self.max_num_running_reqs = min(
+            original_max_num_running_reqs,
+            len(self.running) + remaining_batch_slots,
+        )
+        try:
+            yield batch_request_limit
+        finally:
+            self.max_num_running_reqs = original_max_num_running_reqs
+            for request, next_decode_eligible_step in deferred_eligibility:
+                request.next_decode_eligible_step = next_decode_eligible_step
+
     def schedule(self, throttle_prefills: bool = False) -> RecomputeSchedulerOutput:
+        with self._limit_pp_batch_requests() as batch_request_limit:
+            scheduler_output = self._schedule(throttle_prefills)
+        if batch_request_limit is not None:
+            assert (
+                len(scheduler_output.num_scheduled_tokens)
+                <= batch_request_limit
+            )
+        return scheduler_output
+
+    def _schedule(
+        self,
+        throttle_prefills: bool = False,
+    ) -> RecomputeSchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.

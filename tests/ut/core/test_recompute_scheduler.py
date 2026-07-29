@@ -3,13 +3,15 @@
 
 from collections import defaultdict
 from types import MethodType, SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.engine import EngineCoreOutput, FinishReason
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_ascend.core.recompute_scheduler import (
+    AsyncRecomputeScheduler,
     RecomputeReqInfo,
     RecomputeScheduler,
 )
@@ -110,3 +112,134 @@ def test_finish_recomputed_request_uses_normal_abort_cleanup():
             client_index=request.client_index,
         )
     ]
+
+
+def test_async_recompute_scheduler_inherits_ppv2_scheduling() -> None:
+    mro = AsyncRecomputeScheduler.__mro__
+    assert mro.index(AsyncScheduler) < mro.index(RecomputeScheduler)
+    assert AsyncRecomputeScheduler.schedule is RecomputeScheduler.schedule
+    assert (
+        AsyncRecomputeScheduler._update_after_schedule
+        is AsyncScheduler._update_after_schedule
+    )
+
+
+def test_recompute_scheduler_applies_dynamic_pp_batch_limit() -> None:
+    scheduler = object.__new__(RecomputeScheduler)
+    scheduler.current_step = 0
+    scheduler.max_num_running_reqs = 25
+    scheduler.parallel_config = SimpleNamespace(pipeline_parallel_size=2)
+    scheduler.use_v2_model_runner = True
+    scheduler.running = []
+    scheduler.get_num_unfinished_requests = MagicMock(return_value=10)
+
+    def fake_recompute_schedule(self, throttle_prefills=False):
+        assert throttle_prefills
+        assert self.max_num_running_reqs == 5
+        return SimpleNamespace(
+            num_scheduled_tokens={
+                f"request-{index}": 1 for index in range(5)
+            }
+        )
+
+    with patch.object(
+        RecomputeScheduler,
+        "_schedule",
+        fake_recompute_schedule,
+    ):
+        output = scheduler.schedule(throttle_prefills=True)
+
+    assert len(output.num_scheduled_tokens) == 5
+    assert scheduler.max_num_running_reqs == 25
+
+
+def test_recompute_scheduler_pp_batch_limit_rounds_up() -> None:
+    get_limit = RecomputeScheduler._get_pp_batch_request_limit
+    assert get_limit(25, 2) == 13
+    assert get_limit(10, 2) == 5
+    assert get_limit(5, 2) == 3
+    assert get_limit(25, 4) == 7
+    assert get_limit(0, 4) == 0
+
+
+def test_recompute_scheduler_defers_dynamic_batch_excess() -> None:
+    scheduler = object.__new__(RecomputeScheduler)
+    scheduler.current_step = 4
+    scheduler.max_num_running_reqs = 25
+    scheduler.parallel_config = SimpleNamespace(pipeline_parallel_size=2)
+    scheduler.use_v2_model_runner = True
+    scheduler.running = [
+        SimpleNamespace(next_decode_eligible_step=0) for _ in range(12)
+    ]
+    scheduler.get_num_unfinished_requests = MagicMock(return_value=17)
+
+    def fake_recompute_schedule(self, throttle_prefills=False):
+        assert [req.next_decode_eligible_step for req in self.running] == (
+            [0] * 9 + [6] * 3
+        )
+        return SimpleNamespace(
+            num_scheduled_tokens={
+                f"request-{index}": 1 for index in range(9)
+            }
+        )
+
+    with patch.object(
+        RecomputeScheduler,
+        "_schedule",
+        fake_recompute_schedule,
+    ):
+        scheduler.schedule()
+
+    assert all(
+        request.next_decode_eligible_step == 0
+        for request in scheduler.running
+    )
+    assert scheduler.max_num_running_reqs == 25
+
+
+def test_recompute_scheduler_bypasses_limit_without_pp() -> None:
+    scheduler = object.__new__(RecomputeScheduler)
+    scheduler.max_num_running_reqs = 25
+    scheduler.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+    scheduler.use_v2_model_runner = True
+
+    def fake_recompute_schedule(self, throttle_prefills=False):
+        assert self.max_num_running_reqs == 25
+        return SimpleNamespace(
+            num_scheduled_tokens={
+                f"request-{index}": 1 for index in range(10)
+            }
+        )
+
+    with patch.object(
+        RecomputeScheduler,
+        "_schedule",
+        fake_recompute_schedule,
+    ):
+        output = scheduler.schedule()
+
+    assert len(output.num_scheduled_tokens) == 10
+
+
+def test_recompute_scheduler_bypasses_limit_for_model_runner_v1() -> None:
+    scheduler = object.__new__(RecomputeScheduler)
+    scheduler.max_num_running_reqs = 25
+    scheduler.parallel_config = SimpleNamespace(pipeline_parallel_size=2)
+    scheduler.use_v2_model_runner = False
+
+    def fake_recompute_schedule(self, throttle_prefills=False):
+        assert self.max_num_running_reqs == 25
+        return SimpleNamespace(
+            num_scheduled_tokens={
+                f"request-{index}": 1 for index in range(10)
+            }
+        )
+
+    with patch.object(
+        RecomputeScheduler,
+        "_schedule",
+        fake_recompute_schedule,
+    ):
+        output = scheduler.schedule()
+
+    assert len(output.num_scheduled_tokens) == 10
