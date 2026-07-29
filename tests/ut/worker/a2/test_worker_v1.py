@@ -872,6 +872,7 @@ class TestNPUWorker(TestBase):
             worker.vllm_config = MagicMock()
             worker.vllm_config.parallel_config = MagicMock()
             worker.vllm_config.parallel_config.distributed_executor_backend = "ray"
+            worker.use_v2_model_runner = True
             worker.profiler = None
             worker._pp_send_work = []
 
@@ -885,10 +886,8 @@ class TestNPUWorker(TestBase):
             mock_pp_group.irecv_tensor_dict.return_value = ({"tensor": "data"}, None, None)
             mock_pp_group.isend_tensor_dict.return_value = []
 
-            # Mock return IntermediateTensors - use real type
-            mock_intermediate_output = MagicMock(spec=IntermediateTensors)
-            mock_intermediate_output.tensors = {"output_tensor": "data"}
-            mock_intermediate_output.kv_connector_output = None  # Set to None to trigger return None
+            # MRV2 returns plain IntermediateTensors without kv_connector_output.
+            mock_intermediate_output = IntermediateTensors({"output_tensor": "data"})
             worker.model_runner.execute_model.return_value = mock_intermediate_output
 
             mock_scheduler_output = MagicMock()
