@@ -54,6 +54,68 @@ def _preview_tensor(tensor: torch.Tensor | None, rows: int = 4, cols: int = 8):
         return f"<preview failed: {e}>"
 
 
+def _get_eagle3_expected_aux_count(
+    draft_model: torch.nn.Module,
+    hidden_states: torch.Tensor,
+) -> int | None:
+    inner_model = getattr(draft_model, "model", None)
+    if inner_model is None:
+        return None
+    if not getattr(inner_model, "use_aux_hidden_state", True):
+        return 0
+
+    num_aux_layers = getattr(inner_model, "num_aux_layers", None)
+    if num_aux_layers is not None:
+        return int(num_aux_layers)
+
+    num_aux_hidden_states = getattr(inner_model, "num_aux_hidden_states", None)
+    if num_aux_hidden_states is not None:
+        return int(num_aux_hidden_states)
+
+    fc_input_size = getattr(inner_model, "fc_input_size", None)
+    if fc_input_size is None:
+        return None
+
+    config = getattr(inner_model, "config", None)
+    target_hidden_size = getattr(config, "target_hidden_size", hidden_states.shape[-1])
+    if target_hidden_size <= 0 or fc_input_size % target_hidden_size != 0:
+        return None
+    return int(fc_input_size // target_hidden_size)
+
+
+def _normalize_eagle3_dummy_aux_hidden_states(
+    draft_model: torch.nn.Module,
+    last_hidden_states: torch.Tensor,
+    aux_hidden_states: list[torch.Tensor] | None,
+) -> list[torch.Tensor] | None:
+    expected_count = _get_eagle3_expected_aux_count(draft_model, last_hidden_states)
+    if expected_count is None:
+        return aux_hidden_states
+    if expected_count == 0:
+        return None
+
+    normalized_aux = list(aux_hidden_states or [])
+    actual_count = len(normalized_aux)
+    if actual_count == expected_count:
+        return aux_hidden_states
+
+    if actual_count > expected_count:
+        normalized_aux = normalized_aux[:expected_count]
+    else:
+        reference = normalized_aux[0] if normalized_aux else last_hidden_states
+        normalized_aux.extend(
+            torch.zeros_like(reference) for _ in range(expected_count - actual_count)
+        )
+
+    logger.warning(
+        "Adjusted Eagle3 dummy aux hidden states from %d to %d to match "
+        "the drafter input size.",
+        actual_count,
+        expected_count,
+    )
+    return normalized_aux
+
+
 class AscendEagleSpeculator(EagleSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         """Override GPU EagleSpeculator.__init__ for Ascend NPUs.
@@ -130,6 +192,12 @@ class AscendEagleSpeculator(EagleSpeculator):
         generate_draft.
         """
         self.input_batch = input_batch
+        if self.method == "eagle3" and dummy_run:
+            aux_hidden_states = _normalize_eagle3_dummy_aux_hidden_states(
+                self.model,
+                last_hidden_states,
+                aux_hidden_states,
+            )
         should_log_debug = (
             self.method == "eagle3"
             and not dummy_run
