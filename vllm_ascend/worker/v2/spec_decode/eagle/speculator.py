@@ -103,9 +103,9 @@ def _normalize_eagle3_dummy_aux_hidden_states(
         normalized_aux = normalized_aux[:expected_count]
     else:
         reference = normalized_aux[0] if normalized_aux else last_hidden_states
-        normalized_aux.extend(
-            torch.zeros_like(reference) for _ in range(expected_count - actual_count)
-        )
+        # Dummy values are never returned to a request. Reuse an existing
+        # buffer so startup profiling does not count a large temporary tensor.
+        normalized_aux.extend([reference] * (expected_count - actual_count))
 
     logger.warning(
         "Adjusted Eagle3 dummy aux hidden states from %d to %d to match "
