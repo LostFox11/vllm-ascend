@@ -181,13 +181,6 @@ class NPUModelRunner(GPUModelRunner):
             pin_memory=True,
         )
 
-        # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
-        # TODO: remove set_cos_and_sin (together with update_cos_sin) when mla can properly handle cos/sin internally
-        self.decode_query_len = self.num_speculative_steps + 1
-        set_cos_and_sin(vllm_config, self.max_num_reqs, self.decode_query_len, self.dtype, self.device)
-        set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.decode_query_len)
-        set_mc2_mask(vllm_config, self.device)
-
         # we need to update full graph params in run_fullgraph,
         # so create a stream to update full graph params.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
@@ -204,6 +197,23 @@ class NPUModelRunner(GPUModelRunner):
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         super().load_model(load_dummy_weights, *args, **kwargs)
+        # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication
+        # optimization after upstream initializes model_state/decode_query_len.
+        # TODO: remove set_cos_and_sin (together with update_cos_sin) when
+        # mla/sfa can properly handle cos/sin internally.
+        set_cos_and_sin(
+            self.vllm_config,
+            self.max_num_reqs,
+            self.decode_query_len,
+            self.dtype,
+            self.device,
+        )
+        set_mc2_tokens_capacity(
+            self.vllm_config,
+            self.max_num_reqs,
+            self.decode_query_len,
+        )
+        set_mc2_mask(self.vllm_config, self.device)
         if not _is_eagle3_pp(self.vllm_config):
             return
 
@@ -346,7 +356,7 @@ class NPUModelRunner(GPUModelRunner):
         async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
 
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
-        query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
+        query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
         num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[idx_mapping_np]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
@@ -371,7 +381,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
         )
-        seq_lens = self.input_buffers.seq_lens[:num_reqs]
+        seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
         # Pad for full CUDA graph mode.
         self.input_buffers.seq_lens_np[num_reqs_padded:] = 0
