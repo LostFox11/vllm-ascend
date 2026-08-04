@@ -19,11 +19,13 @@
 
 from contextlib import contextmanager
 import logging
+from typing import cast
 
 import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.models.interfaces import SupportsEagle3, supports_eagle3
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
@@ -65,6 +67,17 @@ def _is_eagle3_pp(vllm_config: VllmConfig) -> bool:
         and speculative_config.method == "eagle3"
         and vllm_config.parallel_config.pipeline_parallel_size > 1
     )
+
+
+def _eagle3_pp_uses_aux_hidden_state(vllm_config: VllmConfig) -> bool:
+    speculative_config = vllm_config.speculative_config
+    if not (speculative_config and speculative_config.draft_model_config):
+        return True
+    hf_config = speculative_config.draft_model_config.hf_config
+    eagle_config = getattr(hf_config, "eagle_config", None) or {}
+    if isinstance(eagle_config, dict):
+        return eagle_config.get("use_aux_hidden_state", True)
+    return True
 
 
 @contextmanager
@@ -135,7 +148,9 @@ class NPUModelRunner(GPUModelRunner):
             super().__init__(vllm_config, device)
 
         if _is_eagle3_pp(vllm_config):
-            self.use_aux_hidden_state_outputs = True
+            self.use_aux_hidden_state_outputs = _eagle3_pp_uses_aux_hidden_state(
+                vllm_config
+            )
 
         # because we will override these attribute, delete these attribute to
         # make sure it's collected by python gc immediately.
@@ -217,6 +232,7 @@ class NPUModelRunner(GPUModelRunner):
         if not _is_eagle3_pp(self.vllm_config):
             return
 
+        self._set_eagle3_pp_default_aux_layers()
         inner_model = _get_inner_language_model(self.model)
         from vllm_ascend.patch.worker.patch_eagle3_pp_aux import (
             patch_eagle3_pp_aux_propagation,
@@ -232,6 +248,26 @@ class NPUModelRunner(GPUModelRunner):
                     dtype=self.model_config.dtype,
                     device=self.device,
                 )
+
+    def _set_eagle3_pp_default_aux_layers(self) -> None:
+        if not self.use_aux_hidden_state_outputs:
+            return
+        if not supports_eagle3(self.model) or isinstance(self.model, type):
+            return
+
+        eagle3_model = cast(SupportsEagle3, self.model)
+        aux_layers = eagle3_model.get_eagle3_default_aux_hidden_state_layers()
+        inner_model = _get_inner_language_model(self.model)
+        current_aux_layers = getattr(inner_model, "aux_hidden_state_layers", ())
+        if current_aux_layers and current_aux_layers != aux_layers:
+            logger.warning(
+                "Ignoring Eagle3 auxiliary layers from config %s in PP because "
+                "the Ascend Eagle3 drafter expects the default auxiliary "
+                "hidden states %s.",
+                current_aux_layers,
+                aux_layers,
+            )
+        eagle3_model.set_aux_hidden_state_layers(aux_layers)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
