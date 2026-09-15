@@ -76,7 +76,12 @@ def test_qwen35_pp_mtp_full_decode_only() -> None:
         def check_answer(question: str, expected: int):
             response = client.chat.completions.create(
                 model=MODEL,
-                messages=[{"role": "user", "content": question}],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": question + "\nEnd your response with a final line in the format answer:<integer>.",
+                    }
+                ],
                 temperature=0,
                 max_tokens=2048,
                 extra_body={"chat_template_kwargs": {"enable_thinking": True}},
@@ -84,7 +89,7 @@ def test_qwen35_pp_mtp_full_decode_only() -> None:
             choice = response.choices[0]
             assert choice.finish_reason == "stop", choice
             text = choice.message.content or ""
-            numbers = re.findall(r"-?\d+", text.rsplit("</think>", 1)[-1])
+            numbers = re.findall(r"(?im)^answer:\s*(-?\d+)\s*$", text.rsplit("</think>", 1)[-1])
             assert numbers and int(numbers[-1]) == expected, text
             return response
 
