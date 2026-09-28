@@ -118,6 +118,14 @@ class NPUModelRunner(GPUModelRunner):
         # Native PP owns token broadcast/writeback; only releases use our packing.
         # Legacy Spec+PP transport (0.28/0.29 only); deleted when 0.30+ is the floor.
         self.use_spec_pp = spec_pp_support is not None and use_legacy_spec_pp()
+        # K3's FIA path needs exact host counts on every speculative PP stage.
+        # Other models retain the existing last-stage/speculator sync behavior.
+        self.sync_spec_pp_cpu_counts = (
+            self.use_pp
+            and self.num_speculative_steps > 0
+            and self.model_config.architecture
+            in ("KimiLinearForCausalLM", "KimiK3ForCausalLM", "KimiK3ForConditionalGeneration")
+        )
         # These draft heads consume target aux states collected across PP ranks.
         if spec_pp_support is not None and spec_pp_support.needs_aux_hidden_states:
             self.use_aux_hidden_state_outputs = True
@@ -799,17 +807,15 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc,
         )
 
-        # Non-last speculative PP stages also receive corrected device positions,
-        # although only the last stage owns a speculator. Native PP needs the
-        # same host-length correction as the legacy token protocol.
-        if self.speculator is not None or (self.use_pp and self.num_speculative_steps > 0):
+        # Opted-in non-last stages also need corrected host positions, even
+        # though only the last stage owns a speculator.
+        if self.speculator is not None or self.sync_spec_pp_cpu_counts:
             self._copy_num_computed_tokens_to_cpu()
 
     def postprocess_num_computed_tokens(self, input_batch: AscendInputBatch) -> None:
         super().postprocess_num_computed_tokens(input_batch)
-        # Non-last PP stages advance prefill chunks without sampled-token output.
-        # Keep the CPU snapshot fresh before the next chunk prepares seq_lens.
-        if self.use_pp and self.num_speculative_steps > 0:
+        # Opted-in stages must refresh the snapshot after unsampled prefill chunks.
+        if self.sync_spec_pp_cpu_counts:
             self._copy_num_computed_tokens_to_cpu()
 
     def _copy_num_computed_tokens_to_cpu(self):
@@ -836,7 +842,7 @@ class NPUModelRunner(GPUModelRunner):
         # MTP needs D2H copy to get reverted num_computed_tokens after rejection.
         # req_states.num_computed_tokens_cpu shares storage with its NumPy view,
         # so this update also corrects the num_computed_tokens_np used by PCP.
-        if self.speculator is not None or (self.use_pp and self.num_speculative_steps > 0):
+        if self.speculator is not None or self.sync_spec_pp_cpu_counts:
             self.num_computed_tokens_event.synchronize()
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 req_index = self.req_states.req_id_to_index[req_id]
