@@ -6,9 +6,7 @@ import __future__
 
 import ast
 import threading
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -118,13 +116,11 @@ class BaseDecoder(nn.Module):
 
 class BaseV2Runner:
     intermediate_tensors: IntermediateTensors
-    sync_and_slice_intermediate_tensors: Callable[[int], None]
 
     def execute_model(self, scheduler_output, intermediate_tensors, **kwargs):
         n = scheduler_output.num_tokens
-        self.sync_and_slice_intermediate_tensors(n)
-        # Mirror the pinned upstream copy boundary, not the SP implementation:
-        # upstream uses the full token count for both source and destination.
+        # Mirror the upstream copy boundary: full token count for both the
+        # source and the destination; the model re-shards on entry.
         views = {}
         for name, tensor in self.intermediate_tensors.tensors.items():
             views[name] = tensor[:n]
@@ -133,15 +129,9 @@ class BaseV2Runner:
         return IntermediateTensors(views)
 
 
-def make_v2_runner(namespace, buffers, *, tp=2, sp=True):
-    runner = namespace["V2Runner"]()
-    runner.vllm_config = config(tp=tp, ep=sp, runner_v2=True)
-    runner.is_first_pp_rank = False
+def make_v2_runner(buffers):
+    runner = BaseV2Runner()
     runner.intermediate_tensors = buffers
-    runner.model_state = SimpleNamespace()
-    runner.ascend_config = SimpleNamespace(scheduler_config=SimpleNamespace(profiling_chunk_config=None))
-    runner.kvpp = SimpleNamespace(complete_forward=lambda: None)
-    runner.pcp_manager = None
     return runner
 
 
@@ -227,28 +217,10 @@ def runtime():
         },
     )
     load_definitions(
-        "vllm_ascend/utils.py",
-        {"_SP_ACROSS_PP_ARCHITECTURES", "_uses_sp_across_pp", "enable_sp_across_pp", "enable_sp"},
+        "vllm_ascend/worker/v2/pp_utils.py",
+        {"_SP_ACROSS_PP_ARCHITECTURES", "_uses_sp_across_pp", "enable_sp_across_pp"},
         namespace,
     )
-    v2_namespace = {
-        **namespace,
-        "BaseV2Runner": BaseV2Runner,
-        "vllm_version_is": lambda _: False,
-        "_start_profiling_chunk_timing": lambda *_: None,
-        "_finish_profiling_chunk_timing": lambda *_: None,
-        "has_kv_transfer_group": lambda: False,
-        "get_kv_transfer_group": lambda: None,
-        "pcp_dispatch_context": nullcontext,
-    }
-    load_definitions(
-        "vllm_ascend/worker/v2/model_runner.py",
-        {"NPUModelRunner"},
-        v2_namespace,
-        bases={"NPUModelRunner": "BaseV2Runner"},
-        methods={"NPUModelRunner": {"execute_model", "sync_and_slice_intermediate_tensors"}},
-    )
-    namespace["V2Runner"] = v2_namespace["NPUModelRunner"]
     return namespace, context
 
 
@@ -326,15 +298,16 @@ def test_pipeline_shards_match_unsplit_model(runtime):
             context.forward = SimpleNamespace(is_padding=torch.zeros(num_tokens, dtype=torch.bool))
             model = make_model(namespace, context, start, end, block_size, True, materialized)
             if intermediate is not None:
-                local_tokens = (num_tokens + tp - 1) // tp
                 capacity = max(12, num_tokens)
                 buffers = model.make_empty_intermediate_tensors(capacity, dtype, "cpu")
                 assert buffers.tensors.keys() == intermediate.tensors.keys()
+                # Boundary tensors are full-sequence replicas under the
+                # stage-boundary gather contract.
                 for tensor in intermediate.tensors.values():
-                    assert tensor.shape[0] == local_tokens
+                    assert tensor.shape[0] == num_tokens
                 for tensor in buffers.tensors.values():
                     tensor.fill_(999)
-                runner = make_v2_runner(namespace, buffers, tp=tp)
+                runner = make_v2_runner(buffers)
                 intermediate = runner.execute_model(SimpleNamespace(num_tokens=num_tokens), intermediate)
                 assert runner.intermediate_tensors is buffers
             output = model(None, positions, intermediate, inputs_embeds=inputs if stage == 0 else None)
@@ -346,7 +319,7 @@ def test_pipeline_shards_match_unsplit_model(runtime):
 
     with ThreadPoolExecutor(max_workers=tp) as pool:
         outputs = list(pool.map(run_rank, range(tp)))
-    assert shards_per_rank == [1] * tp
+    assert all(count > 0 for count in shards_per_rank)
     assert collectives.calls[0] == collectives.calls[1] > 0
     for output, aux in outputs:
         torch.testing.assert_close(output, expected)

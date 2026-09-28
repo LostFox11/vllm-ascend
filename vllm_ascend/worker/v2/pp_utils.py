@@ -32,6 +32,49 @@ def use_legacy_spec_pp() -> bool:
     return False
 
 
+# Models whose sequence shards persist between layers. Their PP stages close
+# the sequence-parallel region at the stage boundary (gather on send, shard on
+# receive), the same contract DeepSeek V4 uses, so the upstream PP transport
+# only ever sees replicated full-sequence tensors.
+_SP_ACROSS_PP_ARCHITECTURES = frozenset(
+    {
+        "KimiLinearForCausalLM",
+        "KimiK3ForCausalLM",
+        "KimiK3ForConditionalGeneration",
+    }
+)
+
+
+def _uses_sp_across_pp(vllm_config) -> bool:
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = getattr(hf_config, "architectures", None) or ()
+    return any(architecture in _SP_ACROSS_PP_ARCHITECTURES for architecture in architectures)
+
+
+def enable_sp_across_pp(vllm_config) -> bool:
+    """Whether the model keeps sequence shards between layers, even at DP=1.
+
+    Stage-boundary handling (aux-state transport keys, MRV2 graph buffers)
+    is only adapted on Model Runner V2, so refuse the combination early.
+    """
+    if not _uses_sp_across_pp(vllm_config):
+        return False
+    parallel_config = vllm_config.parallel_config
+    if not (parallel_config.enable_expert_parallel and parallel_config.tensor_parallel_size > 1):
+        return False
+    if parallel_config.pipeline_parallel_size > 1:
+        import vllm.envs as envs
+
+        if not envs.VLLM_USE_V2_MODEL_RUNNER:
+            raise RuntimeError(
+                "Pipeline parallelism with sequence shards kept between "
+                "layers is only supported on Model Runner V2; rerun with "
+                "VLLM_USE_V2_MODEL_RUNNER=1."
+            )
+    return True
+
+
 class _PPAuxHiddenStateModel(Protocol):
     config: "PretrainedConfig"
     start_layer: int

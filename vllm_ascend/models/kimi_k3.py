@@ -80,10 +80,11 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 from vllm_ascend.ops.kimi_kda import AscendKimiK3DeltaAttention  # type: ignore[import-untyped]
-from vllm_ascend.utils import enable_sp_across_pp, get_rotation_path
+from vllm_ascend.utils import get_rotation_path
 from vllm_ascend.worker.v2.pp_utils import (
     PPTransportDataType,
     add_pp_transport_tensors,
+    enable_sp_across_pp,
     get_pp_transport_tensors,
 )
 from vllm_ascend.worker.v2.pp_utils import (
@@ -737,6 +738,8 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        materialized_aux = self.dspark_aux_capture_materialized
+        aux_hidden_states = get_pp_transport_tensors(intermediate_tensors, PPTransportDataType.AUX_HIDDEN_STATES)
         if self.use_sequence_parallel:
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 forward_context = get_forward_context()
@@ -746,11 +749,13 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
                     forward_context.is_padding,
                     positions,
                 )
-            if get_pp_group().is_first_rank:
-                hidden_states = sp_shard(hidden_states)
-
-        materialized_aux = self.dspark_aux_capture_materialized
-        aux_hidden_states = get_pp_transport_tensors(intermediate_tensors, PPTransportDataType.AUX_HIDDEN_STATES)
+            # Every stage starts from full-sequence tensors - the previous
+            # stage closed its sequence-parallel region at the boundary -
+            # and keeps its own shard afterwards, matching DeepSeek V4.
+            hidden_states = sp_shard(hidden_states)
+            if residual is not None:
+                residual = sp_shard(residual)
+            aux_hidden_states = [sp_shard(aux) for aux in aux_hidden_states]
         if not materialized_aux and get_pp_group().is_first_rank:
             aux_hidden_states = self._maybe_add_hidden_state(
                 aux_hidden_states,
@@ -796,6 +801,15 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
                 # An explicitly empty first PP stage has no additive residual
                 # yet. A zero tensor preserves its semantics in the PP buffers.
                 residual = hidden_states.new_zeros(hidden_states.shape[0], 0, hidden_states.shape[-1])
+            if self.use_sequence_parallel:
+                # The next PP rank expects full-sequence tensors; close the
+                # sequence-parallel region before crossing the boundary so the
+                # upstream PP transport only sees replicated tensors.
+                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+                residual = sp_all_gather(residual)[:full_num_tokens]
+                aux_hidden_states = [
+                    sp_all_gather(aux)[:full_num_tokens] for aux in aux_hidden_states
+                ]
             return add_pp_transport_tensors(
                 IntermediateTensors({"hidden_states": hidden_states, "residual": residual}),
                 PPTransportDataType.AUX_HIDDEN_STATES,
