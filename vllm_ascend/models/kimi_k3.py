@@ -8,6 +8,7 @@ the generic MLA/MoE implementation and the Ascend KDA backend.
 """
 
 import math
+from bisect import bisect_left
 from copy import copy
 
 import torch
@@ -18,6 +19,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.parallel_state import model_parallel_is_initialized
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
@@ -526,17 +528,6 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
         # Ascend attention returns its output instead of filling an AMD buffer.
         return self.self_attn(positions=positions, hidden_states=hidden_states)
 
-    def _run_mlp(self, hidden_states: torch.Tensor, full_num_tokens: int) -> torch.Tensor:
-        # Routed MoE already consumes SP shards. Dense layers still have
-        # TP-sharded weights and need the same AG/RS boundaries as attention.
-        dense_sp = self.use_sequence_parallel and not self.is_moe_layer
-        if dense_sp:
-            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
-        hidden_states = self.mlp(hidden_states)
-        if dense_sp:
-            hidden_states = sp_reduce_scatter(hidden_states)
-        return hidden_states
-
     def forward_attn_residual(
         self,
         positions: torch.Tensor,
@@ -578,7 +569,7 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
             mlp_valid_blocks,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self._run_mlp(hidden_states, positions.shape[0])
+        hidden_states = self.mlp(hidden_states)
         hidden_states = prefix_sum + hidden_states
         return hidden_states, block_residual
 
@@ -612,6 +603,14 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         config = vllm_config.model_config.hf_text_config
         self.config = config
         self.vocab_size = config.vocab_size
+        # Only the last PP stage loads the drafter. Select its aux contract
+        # on every stage before upstream reserves receive buffers/relay slots.
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None and spec_config.method == "dspark":
+            draft_config = spec_config.draft_model_config.hf_config
+            self.dspark_aux_capture_materialized = draft_config.model_type == "qwen3" and any(
+                arch in ("DSparkDraftModel", "Qwen3DSparkModel") for arch in (draft_config.architectures or ())
+            )
         # vLLM's generic MoE SP switch currently requires DP > 1. K3 also
         # needs the same rank-local token layout for the TP/EP, DP=1 topology
         # that FlashComm used before the standard SP operators were available.
@@ -662,6 +661,22 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
 
         world_size = get_tensor_model_parallel_world_size()
         assert config.num_attention_heads % world_size == 0, "num_attention_heads must be divisible by world_size"
+
+    def _cache_aux_pp_layout(self) -> None:
+        super()._cache_aux_pp_layout()
+        if (
+            self.config.attn_res_block_size is None
+            or not self.dspark_aux_capture_materialized
+            or not model_parallel_is_initialized()
+        ):
+            return
+        pp = get_pp_group()
+        if not pp.is_first_rank:
+            # A materialized state at start_layer belongs to this stage,
+            # unlike the raw state emitted by the preceding stage.
+            self._aux_slot_base_cached = bisect_left(self.aux_hidden_state_layers, self.start_layer)
+        if pp.is_last_rank:
+            self._aux_upstream_total_cached = self._aux_slot_base_cached
 
     def _maybe_add_hidden_state(
         self,
@@ -811,9 +826,7 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
                 # upstream PP transport only sees replicated tensors.
                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
                 residual = sp_all_gather(residual)[:full_num_tokens]
-                aux_hidden_states = [
-                    sp_all_gather(aux)[:full_num_tokens] for aux in aux_hidden_states
-                ]
+                aux_hidden_states = [sp_all_gather(aux)[:full_num_tokens] for aux in aux_hidden_states]
             return add_pp_transport_tensors(
                 IntermediateTensors({"hidden_states": hidden_states, "residual": residual}),
                 PPTransportDataType.AUX_HIDDEN_STATES,

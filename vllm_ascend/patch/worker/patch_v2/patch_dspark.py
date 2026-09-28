@@ -65,11 +65,7 @@ def _pp_safe_maybe_share_target_embed(draft_model, draft_inner, target_inner):
     target_embed = getattr(target_inner, "embed_tokens", None) or getattr(target_inner, "embedding", None)
     if isinstance(target_embed, model_utils.PPMissingLayer):
         target_embed = None
-    if (
-        target_embed is None
-        and get_pp_group().world_size > 1
-        and hasattr(draft_model, "post_process")
-    ):
+    if target_embed is None and get_pp_group().world_size > 1 and hasattr(draft_model, "post_process"):
         return
     return _original_maybe_share_target_embed(draft_model, draft_inner, target_inner)
 

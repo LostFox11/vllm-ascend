@@ -801,15 +801,16 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         # Non-last speculative PP stages also receive corrected device positions,
-        # although only the last stage owns a speculator.
-        if self.speculator is not None or self.use_spec_pp:
+        # although only the last stage owns a speculator. Native PP needs the
+        # same host-length correction as the legacy token protocol.
+        if self.speculator is not None or (self.use_pp and self.num_speculative_steps > 0):
             self._copy_num_computed_tokens_to_cpu()
 
     def postprocess_num_computed_tokens(self, input_batch: AscendInputBatch) -> None:
         super().postprocess_num_computed_tokens(input_batch)
         # Non-last PP stages advance prefill chunks without sampled-token output.
         # Keep the CPU snapshot fresh before the next chunk prepares seq_lens.
-        if self.use_spec_pp:
+        if self.use_pp and self.num_speculative_steps > 0:
             self._copy_num_computed_tokens_to_cpu()
 
     def _copy_num_computed_tokens_to_cpu(self):
@@ -836,7 +837,7 @@ class NPUModelRunner(GPUModelRunner):
         # MTP needs D2H copy to get reverted num_computed_tokens after rejection.
         # req_states.num_computed_tokens_cpu shares storage with its NumPy view,
         # so this update also corrects the num_computed_tokens_np used by PCP.
-        if self.speculator is not None or self.use_spec_pp:
+        if self.speculator is not None or (self.use_pp and self.num_speculative_steps > 0):
             self.num_computed_tokens_event.synchronize()
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 req_index = self.req_states.req_id_to_index[req_id]

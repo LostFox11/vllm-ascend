@@ -89,12 +89,6 @@ def test_pp_guard_noop_preserves_partition(monkeypatch, legacy, support):
         assert config.parallel_config.pipeline_parallel_size == 2
         assert vllm_envs.VLLM_PP_LAYER_PARTITION == "42,36"
 
-from types import SimpleNamespace
-
-import pytest
-
-from vllm_ascend.worker.v2.pp_utils import resolve_spec_pp_support
-
 
 def _make_config(
     architecture: str,
