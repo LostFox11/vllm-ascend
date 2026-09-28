@@ -585,10 +585,9 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
 class AscendKimiLinearModel(UpstreamKimiLinearModel):
     """Kimi text model assembled from the Ascend decoder layer."""
 
-    # The Ascend forward path carries cumulative auxiliary states across PP.
-    # Use the same keys for MRV2 receive buffers and intermediate-stage relay.
+    # The Ascend forward path carries cumulative auxiliary states across PP
+    # via IntermediateTensors (see pp_utils.PPTransportDataType).
     supports_aux_hidden_states_over_pp = True
-    AUX_HIDDEN_STATE_KEY = "pp_transport_aux_hidden_states_"
 
     packed_modules_mapping = {
         name: list(shards) for name, shards in UpstreamPackedKimiLinearModel.packed_modules_mapping.items()
