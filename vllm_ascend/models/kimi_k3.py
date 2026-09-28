@@ -589,6 +589,10 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
     # The Ascend forward path carries cumulative auxiliary states across PP
     # via IntermediateTensors (see pp_utils.PPTransportDataType).
     supports_aux_hidden_states_over_pp = True
+    # Upstream's reserve_aux_intermediate_tensor_slots / relay_aux_hidden_states
+    # read this via getattr to name and forward the receive-buffer aux slots;
+    # it must equal pp_utils' transport key prefix so both sides agree.
+    AUX_HIDDEN_STATE_KEY = "pp_transport_aux_hidden_states_"
 
     packed_modules_mapping = {
         name: list(shards) for name, shards in UpstreamPackedKimiLinearModel.packed_modules_mapping.items()
