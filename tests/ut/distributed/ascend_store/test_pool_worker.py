@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 
@@ -118,6 +119,7 @@ def make_worker(
     if kv_cache_config is not None:
         config.scheduler_config.disable_hybrid_kv_cache_manager = False
     config.cache_config.block_size = cache_block_size
+    config.cache_config.prefix_cache_retention_interval = 0
     config.kv_events_config = None
     if enable_kv_events:
         config.kv_events_config = MagicMock(enable_kv_cache_events=True)
@@ -125,6 +127,29 @@ def make_worker(
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
     return KVPoolWorker(config, use_layerwise=use_layerwise, kv_cache_config=kv_cache_config)
+
+
+@pytest.mark.parametrize("retention_interval", [None, 0, 4096])
+def test_cache_coordinator_uses_kv_cache_config_retention_interval(retention_interval):
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import pool_worker
+
+    worker = pool_worker.KVPoolWorker.__new__(pool_worker.KVPoolWorker)
+    worker.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[object()],
+        prefix_cache_retention_interval=retention_interval,
+    )
+    worker.use_hybrid = True
+    worker.cache_transfer_granularity = 16
+    worker.hash_block_size = 16
+    worker.grouped_block_size = [16]
+    worker.kv_cache_group_families = ["mamba"]
+
+    vllm_config = SimpleNamespace(speculative_config=None)
+    with patch.object(pool_worker, "AscendStoreCoordinator") as coordinator_cls:
+        coordinator = worker._build_cache_coordinator(vllm_config)
+
+    assert coordinator is coordinator_cls.return_value
+    assert coordinator_cls.call_args.kwargs["retention_interval"] == retention_interval
 
 
 class TestPCPPoolWorker(unittest.TestCase):
@@ -167,7 +192,8 @@ class TestLayerwiseAttentionSave(unittest.TestCase):
                     FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32),
                 )
                 for layer in range(2)
-            ]
+            ],
+            prefix_cache_retention_interval=None,
         )
         worker = make_worker(self, use_layerwise=True, kv_cache_config=plan)
         worker.kv_send_thread = MagicMock(request_queue=queue.Queue())
@@ -186,7 +212,8 @@ class TestLayerwiseAttentionSave(unittest.TestCase):
                         mamba_cache_mode="align",
                     ),
                 )
-            ]
+            ],
+            prefix_cache_retention_interval=None,
         )
         worker = make_worker(self, num_layers=1, use_layerwise=True, kv_cache_config=plan)
         worker.kv_recv_thread = MagicMock()
@@ -222,7 +249,10 @@ class TestLayerwiseAttentionSave(unittest.TestCase):
                     self,
                     num_layers=2,
                     use_layerwise=True,
-                    kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+                    kv_cache_config=SimpleNamespace(
+                        kv_cache_groups=groups,
+                        prefix_cache_retention_interval=None,
+                    ),
                     pp_rank=1,
                     pp_partition=(2, 2),
                 )
@@ -1047,6 +1077,43 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.register_kv_caches(kv_caches)
         self.assertEqual(len(worker.group_kv_caches_base_addr[0]), 2)
         worker.m_store.register_buffer.assert_called_once()
+
+    def test_register_nope_cache_skips_empty_rope_view(self):
+        # A NoPE RoPE view is empty but retains its parent's backing storage.
+        # Registering its null data_ptr would corrupt the aligned region start.
+        alignment = 2 * 1024 * 1024
+        backing = torch.empty(alignment + 64, dtype=torch.uint8)
+        offset = -backing.data_ptr() % alignment
+        cache = backing[offset : offset + 64].view(4, 16)
+        empty_rope = cache[:, :0]
+        self.assertEqual(empty_rope.data_ptr(), 0)
+        self.assertEqual(empty_rope.untyped_storage().data_ptr(), backing.data_ptr())
+
+        for container in (tuple, list):
+            with self.subTest(container=container):
+                worker = self._make_worker()
+                worker.use_hybrid = True
+                worker._transfer_threads_started = True
+                worker.register_kv_caches({"layer.0": container((cache, empty_rope))})
+
+                worker.m_store.register_buffer.assert_called_once_with([cache.data_ptr()], [64])
+                self.assertEqual(worker.kv_caches_base_addr, [cache.data_ptr()])
+                self.assertEqual(worker.group_kv_caches_base_addr[0], [cache.data_ptr()])
+                self.assertEqual(worker.group_block_len[0], [16])
+                self.assertEqual(worker.group_block_stride[0], [16])
+
+    def test_as_cache_tuple_empty_and_nonempty_tensors(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+
+        cache = torch.zeros(2, 4)
+        empty = cache[:, :0]
+        self.assertEqual(KVPoolWorker._as_cache_tuple(empty), ())
+        self.assertEqual(KVPoolWorker._as_cache_tuple((empty,)), ())
+        self.assertEqual(KVPoolWorker._as_cache_tuple([empty]), ())
+        for value in (cache, (cache,), [cache], (empty, cache)):
+            result = KVPoolWorker._as_cache_tuple(value)
+            self.assertEqual(len(result), 1)
+            self.assertIs(result[0], cache)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.threading.Event")
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreRecvingThread")
