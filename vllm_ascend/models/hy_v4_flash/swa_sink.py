@@ -4,21 +4,22 @@
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+# Sequence length and head strides may change with every prefill chunk.
+@triton.jit(do_not_specialize=["tokens", "max_head_stride", "sum_head_stride", "context_head_stride"])
 def _sink_correct_into(
     context,
     row_max,
     row_sum,
     sink,
     output,
-    tokens: tl.constexpr,
+    tokens,
     first_head: tl.constexpr,
     context_token_stride: tl.constexpr,
-    context_head_stride: tl.constexpr,
+    context_head_stride,
     context_value_stride: tl.constexpr,
-    max_head_stride: tl.constexpr,
+    max_head_stride,
     max_token_stride: tl.constexpr,
-    sum_head_stride: tl.constexpr,
+    sum_head_stride,
     sum_token_stride: tl.constexpr,
     sink_stride: tl.constexpr,
     output_heads: tl.constexpr,
