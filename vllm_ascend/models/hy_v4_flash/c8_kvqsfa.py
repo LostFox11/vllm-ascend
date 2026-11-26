@@ -51,7 +51,7 @@ def attend_c8_v2(query, cache, block_table, block_size, selected, seq_len, sink,
 
         query = query[compact_prefix:].contiguous()
         indices = selected[compact_prefix:].to(torch.int32).unsqueeze(1).contiguous()
-        if query.shape[0] >= 512 and query.shape[1:] == (8, 576) and indices.shape[-1] == 2048:
+        if query.shape[0] >= 512 and query.shape[1:] in ((8, 576), (16, 576)) and indices.shape[-1] == 2048:
             # The page gather already placed every requested C8 row in logical
             # order. Truncate the last page and let the kernel index that view.
             dense_kv = packed.reshape(-1, 1, C8_ROW_BYTES)[:seq_len].unsqueeze(0)
