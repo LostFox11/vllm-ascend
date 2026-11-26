@@ -12,7 +12,6 @@ from vllm_ascend.hisparse.c8 import C8_ROW_BYTES, dequantize_c8_rows
 
 from .prefill_metadata import sparse_lengths, window_indices
 
-
 BANDED_HEADS = 16
 
 

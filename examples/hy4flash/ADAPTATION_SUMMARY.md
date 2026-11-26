@@ -165,7 +165,6 @@ git -C vllm apply ../vllm-ascend/patches/hy4flash-vllm-ba15685.patch
 install -m 0755 vllm-ascend/examples/hy4flash/start_hy4flash.sh ./start_hy4flash.sh
 ```
 
-
 ### P 端流水线并行
 
 四张 950DT 上可将专用 P 实例设置为 `--tensor-parallel-size 2 --pipeline-parallel-size 2`。

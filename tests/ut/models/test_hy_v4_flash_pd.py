@@ -63,7 +63,9 @@ def test_pipeline_rejects_unsupported_execution_modes(unsupported):
     text = SimpleNamespace(validate_flash_config=lambda: None, enable_ihc=unsupported != "no_ihc")
     config = SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=text, enforce_eager=unsupported != "graph"),
-        parallel_config=SimpleNamespace(pipeline_parallel_size=2, use_sequence_parallel_moe=unsupported == "sequence_parallel"),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2, use_sequence_parallel_moe=unsupported == "sequence_parallel"
+        ),
         kv_transfer_config=SimpleNamespace(kv_role="kv_consumer" if unsupported == "decode" else "kv_producer"),
         speculative_config=object() if unsupported == "speculative" else None,
     )

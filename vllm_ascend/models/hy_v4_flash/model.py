@@ -272,7 +272,13 @@ class AscendHYV4FlashModel(HYV4FlashModel):
                     )
         if self.pipeline_parallel and self.engram_hash is not None:
             return self._forward_stage_with_engram(
-                input_ids, positions, intermediate_tensors, inputs_embeds, lookback_token_ids, prepared_engram, defer_hc_head
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                lookback_token_ids,
+                prepared_engram,
+                defer_hc_head,
             )
         if not defer_hc_head or self.engram_hash is None:
             return super().forward(
@@ -337,7 +343,14 @@ class AscendHYV4FlashModel(HYV4FlashModel):
         return hidden
 
     def _forward_stage_with_engram(
-        self, input_ids, positions, intermediate_tensors, inputs_embeds, lookback_token_ids, prepared_engram, defer_hc_head
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors,
+        inputs_embeds,
+        lookback_token_ids,
+        prepared_engram,
+        defer_hc_head,
     ):
         if input_ids is None and prepared_engram is None:
             raise ValueError("Flash Engram requires original input token IDs")

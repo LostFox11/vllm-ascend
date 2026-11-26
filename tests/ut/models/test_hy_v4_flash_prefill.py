@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -227,3 +228,37 @@ def test_split_window_sink_kernel_writes_each_head_slice():
         _write_window_output(context[:, part], maximum, total, sink, output, first)
         expected = context[:, part].float() * torch.sigmoid(log_partition - sink[part]).unsqueeze(-1)
         torch.testing.assert_close(output[:, part], expected.bfloat16(), atol=0.015625, rtol=0.0078125)
+
+
+@pytest.mark.parametrize(
+    "heads,queries,layout",
+    [(8, 512, "BSND"), (16, 512, "BSND"), (16, 511, "PA_BSND"), (32, 512, "PA_BSND")],
+)
+def test_sparse_kv_preserves_logical_page_order(monkeypatch, heads, queries, layout):
+    block_size, length = 64, 513
+    row_bytes = c8_kvqsfa.C8_ROW_BYTES
+    table = torch.arange(8, -1, -1, dtype=torch.int32)
+    # A distinct byte per physical row exposes page reordering and last-page truncation.
+    row_ids = torch.arange(9 * block_size).to(torch.uint8)
+    cache = row_ids[:, None].expand(-1, row_bytes + 4).contiguous()
+    expected = row_ids.view(-1, block_size)[table.long()].flatten()
+    query = torch.empty(queries, heads, 576, dtype=torch.bfloat16)
+    selected = torch.zeros(queries, 2048, dtype=torch.int32)
+
+    def sparse(q, key, value, indices, *args, **options):
+        assert options["layout_kv"] == layout
+        assert key.data_ptr() == value.data_ptr()
+        actual = key.view(torch.uint8).reshape(-1, row_bytes)[:, 0]
+        if layout == "BSND":
+            assert "block_table" not in options
+            torch.testing.assert_close(actual, expected[:length])
+        else:
+            assert options["block_table"].numel() == len(table)
+            torch.testing.assert_close(actual, expected)
+        return q[..., :1], None, None
+
+    monkeypatch.setitem(sys.modules, "cann_ops_transformer", SimpleNamespace(kv_quant_sparse_flash_attention=sparse))
+    context = c8_kvqsfa.attend_c8_v2(
+        query, cache, table, block_size, selected, length, torch.zeros(heads), 1.0, compact_prefix=0
+    )
+    assert context.shape == (queries, heads, 1)
