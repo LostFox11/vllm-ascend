@@ -23,7 +23,6 @@ from .attention_ops import (
     native_mla_context,
     prepare_indexpool_selection,
 )
-from .cache import empty_compact_c8_rows, gather_compact_c8_rows
 from .indexer import select_pool_candidates, write_pool_scores
 
 logger = init_logger_ascend(__name__)
@@ -75,7 +74,8 @@ class DecodeAttentionMixin:
         if self.topk_snapshot is not None:
             self.topk_snapshot[start:stop, : selected.shape[-1]].copy_(selected)
         if self._can_gather_decode_rows(cache, query.dtype):
-            rows = gather_compact_c8_rows(cache, table, block_size, selected)
+            _, gather_rows = self._decode_c8_reader()
+            rows = gather_rows(cache, table, block_size, selected)
         else:
             rows = self._gather_attention_rows(cache, table, block_size, selected, mask_padding=True)
         context = native_mla_context(
@@ -84,6 +84,8 @@ class DecodeAttentionMixin:
             rows,
             self.learnable_sink_param,
             self.scale,
+            length_provider=self._fia_length_provider(selected, start),
+            metadata=meta,
         )
         out[start:stop].copy_(_head_bmm(context, wv).reshape_as(out[start:stop]))
 
@@ -185,11 +187,12 @@ class DecodeAttentionMixin:
                 snapshot[:num_tokens, :window].copy_(selected)
             direct_rows = self._can_gather_decode_rows(cache, query.dtype)
             if direct_rows:
-                rows = empty_compact_c8_rows(num_tokens, window, query.device)
+                allocate_rows, gather_rows = self._decode_c8_reader()
+                rows = allocate_rows(num_tokens, window, query.device)
                 for request in range(batch_size):
                     start = request * num_queries
                     stop = start + num_queries
-                    gather_compact_c8_rows(
+                    gather_rows(
                         cache,
                         meta.block_table[request],
                         block_size,
@@ -213,7 +216,7 @@ class DecodeAttentionMixin:
                     start = request * num_queries
                     target = rows[start : start + num_queries].view(-1, rows.shape[-1])
                     torch.index_select(history, 0, window_rows, out=target)
-            self._attend_decoded(query, selected, rows, wv, out[:num_tokens])
+            self._attend_decoded(query, selected, rows, wv, out[:num_tokens], graph_queries=num_queries)
             out[:num_tokens].masked_fill_(~live.reshape(-1, 1), 0)
             return
 
@@ -404,7 +407,8 @@ class DecodeAttentionMixin:
                 continue
             q = query[start:stop]
             if self._can_gather_decode_rows(cache, q.dtype):
-                rows = gather_compact_c8_rows(cache, table, block_size, selected)
+                _, gather_rows = self._decode_c8_reader()
+                rows = gather_rows(cache, table, block_size, selected)
             elif shared_positions is None:
                 rows = self._gather_attention_rows(cache, table, block_size, selected, mask_padding=True)
             else:
@@ -422,6 +426,8 @@ class DecodeAttentionMixin:
                 rows,
                 wv,
                 out[start:stop],
+                token_start=start,
+                graph_queries=num_queries,
             )
         if batch_sparse:
             logger.info_once("HYV4 Flash gathers sparse Decode C8 cache rows for the whole rank with CANN.")
@@ -443,11 +449,12 @@ class DecodeAttentionMixin:
                 logger.info_once("HYV4 Flash uses batched compact CANN C8 attention for sparse Decode verification.")
                 return
             if self._can_gather_decode_rows(cache, query.dtype):
-                rows = empty_compact_c8_rows(num_tokens, selected.shape[-1], query.device)
+                allocate_rows, gather_rows = self._decode_c8_reader()
+                rows = allocate_rows(num_tokens, selected.shape[-1], query.device)
                 for request in range(batch_size):
                     start = request * num_queries
                     stop = start + num_queries
-                    gather_compact_c8_rows(
+                    gather_rows(
                         cache,
                         meta.block_table[request],
                         block_size,
@@ -465,7 +472,7 @@ class DecodeAttentionMixin:
                 )
                 rows = dequantize_c8_rows(packed).view(num_tokens, selected.shape[-1], query.shape[-1])
                 rows = rows.masked_fill(selected[..., None] < 0, 0)
-            self._attend_decoded(query, selected, rows, wv, out[:num_tokens])
+            self._attend_decoded(query, selected, rows, wv, out[:num_tokens], graph_queries=num_queries)
         if shared_positions is not None:
             # Inactive queries may overlap live KV rows in the unfolded view.
             out[:num_tokens].masked_fill_(~live.reshape(-1, 1), 0)

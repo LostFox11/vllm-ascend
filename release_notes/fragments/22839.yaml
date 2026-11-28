@@ -27,8 +27,8 @@ entries:
   hardware:
   - 950DT
 - category: bugfix
-  text: Preserve HY4 Flash Target attention KV and learned-sink normalization in FP32, retain rounded MoE expert sums, and
-    restore IndexPool position encoding and complete short-context history during batched Decode.
+  text: Retain FP32 HY4 Flash C8 dequantization before the native attention input conversion, rounded MoE expert sums, and
+    IndexPool position encoding and complete short-context history during batched Decode.
   model: hy4-flash
   hardware:
   - 950DT

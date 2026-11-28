@@ -12,7 +12,9 @@ from vllm_ascend.models.hy_v4_flash.indexer import select_pool_candidates
 
 
 def test_decode_pool_keys_keep_position_encoding(monkeypatch):
-    monkeypatch.setattr(attention, "get_flash_attention_metadata", lambda: SimpleNamespace(prefill_reqs=(False,)))
+    monkeypatch.setattr(
+        attention, "get_flash_attention_metadata", lambda layer_name=None: SimpleNamespace(prefill_reqs=(False,))
+    )
     # Isolate the control flow from the device-only pooling kernel.
     monkeypatch.setattr(
         indexer_ops,
@@ -39,6 +41,7 @@ def test_decode_pool_keys_keep_position_encoding(monkeypatch):
         )
 
     spec = SimpleNamespace(
+        metadata_layer_name="model.layers.0.self_attn",
         ratio=4,
         key_value_projection=SimpleNamespace(weight=weight),
         key_gate_projection=SimpleNamespace(weight=weight * 0.7),

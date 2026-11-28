@@ -244,7 +244,7 @@ class EagerAttentionMixin:
                 kv_selected = shared_kv.unfold(0, self.window, 1).transpose(1, 2)
                 if snapshot is not None:
                     snapshot[start:stop, : self.window].copy_(selected)
-                value = self._attend_decoded(query[start:stop], selected, kv_selected, wv)
+                value = self._attend_decoded(query[start:stop], selected, kv_selected, wv, token_start=start)
                 write_output(start, stop, value)
                 continue
             batch_sparse = (
@@ -440,6 +440,7 @@ class EagerAttentionMixin:
                     scores=scores,
                     query_fp32=prefill_query[lo - start : hi - start] if reuse_window else None,
                     fuse_prefill_logits=early_fusion and reuse_window,
+                    token_start=lo,
                 )
                 write_output(lo, hi, value)
             if loop_stop < stop:
@@ -505,7 +506,9 @@ class EagerAttentionMixin:
                     kv_selected = shared_kv.index_select(0, valid_indices.flatten()).view(*selected.shape, -1)
                 if snapshot is not None:
                     snapshot[start:stop, : selected.shape[-1]].copy_(selected)
-                value = self._attend_decoded(query[start:stop], selected, kv_selected, wv, split_pv=True)
+                value = self._attend_decoded(
+                    query[start:stop], selected, kv_selected, wv, split_pv=True, token_start=start
+                )
                 write_output(start, stop, value)
 
         if parts:

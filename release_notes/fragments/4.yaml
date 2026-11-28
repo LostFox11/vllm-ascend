@@ -1,0 +1,15 @@
+pr: 4
+entries:
+  - category: bugfix
+    text: >-
+      Fixed HY4 Flash batched Decode candidate history and IndexPool position
+      encoding, and preserved BF16 expert-sum rounding before normalization.
+  - category: performance
+    text: >-
+      Reduced repeated metadata lookup, Engram projections and layout
+      preparation during HY4 Flash Decode, and restored native CANN attention.
+      An eight-device PD deployment with four Decode devices, DFly5 and local
+      Draft graphs measured 788.48 output token/s for 128 requests at concurrency
+      32 with 131093 input tokens, 1024 output tokens and 99.98398% prefix hits;
+      the same source scored 30/30 on a separate AIME2026 run.
+    model: hy4-flash

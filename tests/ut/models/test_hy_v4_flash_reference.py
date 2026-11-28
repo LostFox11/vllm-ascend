@@ -265,7 +265,7 @@ def test_ihc_rms_uses_global_query_boundaries_on_sequence_shards(monkeypatch):
     from vllm_ascend.models.hy_v4_flash import ihc
 
     metadata = SimpleNamespace(query_start_loc=(0, 7, 11), precise_decode_reqs=(False, True))
-    monkeypatch.setattr(ihc, "get_flash_attention_metadata", lambda: metadata)
+    monkeypatch.setattr(ihc, "get_flash_attention_metadata", lambda layer_name=None: metadata)
     rows = torch.arange(16 * 33, dtype=torch.float32).view(16, 33) / 7
     eps = 1e-5
     means = [rows[:7].square().mean(-1, keepdim=True)]

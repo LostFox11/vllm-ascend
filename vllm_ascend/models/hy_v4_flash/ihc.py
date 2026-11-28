@@ -327,11 +327,13 @@ def _inverse_rms(
     eps: float,
     row_offset: int = 0,
     mean_workers: tuple[torch.npu.Stream, ...] = (),
+    *,
+    layer_name: str | None = None,
 ) -> torch.Tensor:
     squares = x.square()
     if x.shape[0] <= 1:
         return (squares.mean(-1, keepdim=True) + eps).rsqrt()
-    batch = get_flash_attention_metadata()
+    batch = get_flash_attention_metadata(layer_name)
     if batch is None or not any(batch.precise_decode_reqs):
         return (squares.mean(-1, keepdim=True) + eps).rsqrt()
 
@@ -377,6 +379,8 @@ def _inverse_rms(
 
 
 class FlashHCPreLayer(HYV4HCPreLayer):
+    metadata_layer_name: str | None = None
+
     sequence_parallel_input = False
     use_cann_inverse_rms = False
     cann_pre_op = None
@@ -421,7 +425,7 @@ class FlashHCPreLayer(HYV4HCPreLayer):
             or getattr(self.hc_fn, "bias", None) is not None
         ):
             return False
-        batch = get_flash_attention_metadata()
+        batch = get_flash_attention_metadata(self.metadata_layer_name)
         return (
             batch is not None
             and bool(batch.prefill_reqs)
@@ -449,7 +453,7 @@ class FlashHCPreLayer(HYV4HCPreLayer):
         ):
             tokens, channels, width = x.shape
             weight, scale, bias = self.hc_fn.weight, self.hc_scale, self.hc_base
-            batch = get_flash_attention_metadata()
+            batch = get_flash_attention_metadata(self.metadata_layer_name)
             if (
                 tokens >= 128
                 and channels == self.hc_mult
@@ -499,7 +503,7 @@ class FlashHCPreLayer(HYV4HCPreLayer):
             and 0 < x.shape[1] <= 16384
             and x.shape[1] % 128 == 0
         ):
-            batch = get_flash_attention_metadata()
+            batch = get_flash_attention_metadata(self.metadata_layer_name)
             weight = self.hc_fn.weight
             if (
                 batch is not None
@@ -514,10 +518,14 @@ class FlashHCPreLayer(HYV4HCPreLayer):
                 # row for its unused normalized output.
                 _, inverse = torch_npu.npu_rms_norm(x, weight[0], self.layernorm_epsilon)
                 return inverse
-        return _inverse_rms(x, self.layernorm_epsilon, row_offset, self.inverse_rms_workers)
+        return _inverse_rms(
+            x, self.layernorm_epsilon, row_offset, self.inverse_rms_workers, layer_name=self.metadata_layer_name
+        )
 
 
 class FlashHCLayer(HYV4HCLayer):
+    metadata_layer_name: str | None = None
+
     pre_layer_cls = FlashHCPreLayer
     use_cann_prefill = False
     cann_post_op = None
@@ -613,7 +621,7 @@ class FlashHCLayer(HYV4HCLayer):
             and hidden_states.is_contiguous()
             and is_forward_context_available()
         ):
-            batch = get_flash_attention_metadata()
+            batch = get_flash_attention_metadata(self.metadata_layer_name)
             token_ids = get_forward_context().additional_kwargs.get("hy4_first_ihc_token_ids")
             if (
                 token_ids is not None
@@ -674,6 +682,8 @@ class FlashHCLayer(HYV4HCLayer):
 
 
 class FlashHCHeadLayer(HYV4HCHeadLayer):
+    metadata_layer_name: str | None = None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.register_buffer("_native_head_phi", None, persistent=False)
@@ -682,7 +692,7 @@ class FlashHCHeadLayer(HYV4HCHeadLayer):
 
     def forward(self, x):
         if (
-            is_decode_batch(get_flash_attention_metadata())
+            is_decode_batch(get_flash_attention_metadata(self.metadata_layer_name))
             and is_950()
             and x.device.type == "npu"
             and x.dtype == torch.bfloat16
@@ -715,4 +725,4 @@ class FlashHCHeadLayer(HYV4HCHeadLayer):
         if not is_forward_context_available():
             # Deferred eager Prefill runs the head on selected rows in sampling.
             return super()._inverse_rms(x)
-        return _inverse_rms(x, self.config.rms_norm_eps)
+        return _inverse_rms(x, self.config.rms_norm_eps, layer_name=self.metadata_layer_name)

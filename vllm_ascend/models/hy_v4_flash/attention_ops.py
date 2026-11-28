@@ -364,37 +364,112 @@ def native_rms_norm(value, norm):
     return torch_npu.npu_rms_norm(value, gamma, eps)[0].to(dtype)
 
 
-def native_mla_context(query, selected, kv, sink, scale, *, scores=None, query_fp32=None):
-    """Keep FP32 KV and sink normalization in the fused attention calculation.
+def _fia_kv_inputs(query, selected, kv):
+    """Adapt legacy and stable-packed C8 layouts to the original FIA ABI."""
+    from .fia_lengths import CompactFIAKV, PackedC8KV, compact_fia_rows
 
-    The CANN MLA FIA ABI accepts only low-precision KV/output and cannot consume
-    a sink for this head dimension. Use the FP32 fusion instead of rounding KV
-    or correcting an already-rounded context. Reader fusion remains enabled.
-    """
-    from .cache import CompactKV
+    if isinstance(kv, PackedC8KV):
+        keys = kv.values.to(query.dtype)
+        return (
+            keys[..., :512].unsqueeze(2).contiguous(),
+            keys[..., 512:].unsqueeze(2).contiguous(),
+        )
+    if isinstance(kv, tuple):
+        nope, rope, _ = kv
+        nope, rope = nope.to(query.dtype), rope.to(query.dtype)
+    else:
+        keys = kv.to(query.dtype).unsqueeze(2)
+        nope = keys[..., :512].contiguous()
+        rope = keys[..., 512:].contiguous()
+    if not isinstance(kv, CompactFIAKV):
+        nope, rope = compact_fia_rows(selected, nope, rope)
+    return nope.contiguous(), rope.contiguous()
+
+
+def native_mla_context(
+    query, selected, kv, sink, scale, *, length_provider=None, metadata=None, scores=None, query_fp32=None
+):
+    """Run CANN FIA; retain fused sink correction and updatable graph tasks."""
+    if query.device.type != "npu":
+        return _reference_mla_context(
+            query,
+            selected,
+            kv,
+            sink,
+            scale,
+            length_provider=length_provider,
+            metadata=metadata,
+            scores=scores,
+            query_fp32=query_fp32,
+        )
+    nope, rope = _fia_kv_inputs(query, selected, kv)
+    kwargs = dict(
+        query=query[..., :512].unsqueeze(1).contiguous(),
+        key=nope,
+        value=nope,
+        query_rope=query[..., 512:].unsqueeze(1).contiguous(),
+        key_rope=rope,
+        num_query_heads=query.shape[1],
+        num_key_value_heads=1,
+        input_layout="BSND",
+        sparse_mode=0,
+        actual_seq_qlen=[1] * query.shape[0],
+        softmax_scale=scale,
+        return_softmax_lse=True,
+    )
+    kwargs.update(length_provider.resolve(metadata))
+    if query.device.type == "npu" and torch.npu.is_current_stream_capturing():
+        from vllm_ascend.compilation.updatable_graph import get_capture_resource, register_task
+
+        workspace_kwargs = {**kwargs, "actual_seq_kvlen": [selected.shape[1]] * query.shape[0]}
+        # Sequential FIA calls on one stream can reuse scratch storage. The
+        # provider is call-specific metadata, not a workspace shape identity.
+        workspace_key = (
+            "hy4.mla.fia.workspace",
+            tuple(kwargs["query"].shape),
+            tuple(nope.shape),
+            tuple(rope.shape),
+            query.dtype,
+            torch.npu.current_stream().npu_stream,
+        )
+        workspace = get_capture_resource(
+            workspace_key,
+            lambda: torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(**workspace_kwargs),
+        )
+        output = torch.empty((query.shape[0], 1, query.shape[1], 512), dtype=query.dtype, device=query.device)
+        lse = torch.empty((query.shape[0], query.shape[1], 1, 1), dtype=torch.float32, device=query.device)
+        register_task(
+            torch_npu.npu_fused_infer_attention_score_v2.out,
+            {**kwargs, "workspace": workspace, "out": [output, lse]},
+            length_provider,
+        )
+    else:
+        output, lse = torch_npu.npu_fused_infer_attention_score_v2(**kwargs)
+    return fused_sink_context(output.squeeze(1), lse, sink, selected)
+
+
+def _reference_mla_context(
+    query, selected, kv, sink, scale, *, length_provider, metadata, scores=None, query_fp32=None
+):
+    """CPU reference only; the NPU runtime uses CANN FIA."""
+    from .fia_lengths import CompactFIAKV, PackedC8KV
 
     invalid_mask = None
-    if isinstance(kv, tuple):
+    if isinstance(kv, PackedC8KV):
+        values, invalid_mask = kv
+        if scores is not None:
+            order = torch.argsort((selected < 0).to(torch.int32), dim=-1, stable=True)
+            scores = scores.gather(-1, order[:, None].expand(-1, scores.shape[1], -1))
+    elif isinstance(kv, tuple):
         nope, rope, mask = kv
         values = torch.cat((nope[:, :, 0].float(), rope[:, :, 0].float()), dim=-1)
         invalid_mask = mask
-        if isinstance(kv, CompactKV) and scores is not None:
+        if isinstance(kv, CompactFIAKV) and scores is not None:
             order = torch.argsort((selected < 0).to(torch.int32), dim=-1, stable=True)
             scores = scores.gather(-1, order[:, None].expand(-1, scores.shape[1], -1))
     else:
         values = kv.float()
     attention_query = query if query_fp32 is None else query_fp32
-    if query.device.type == "npu":
-        return fused_fp32_mla_context(
-            attention_query,
-            selected,
-            values,
-            sink,
-            scale,
-            invalid_mask=invalid_mask,
-            scores=scores,
-            output_dtype=query.dtype,
-        )
     # CPU execution is for reference tests; no CANN/Triton launch is possible.
     if scores is None:
         scores = torch.bmm(attention_query.float(), values.transpose(1, 2))
@@ -405,16 +480,27 @@ def native_mla_context(query, selected, kv, sink, scale, *, scores=None, query_f
     return torch.bmm(probabilities, values[..., :512]).to(query.dtype)
 
 
-def native_indexpool_rope(nope, even, odd, cos, sin, dtype):
+def native_indexpool_rope(nope, even, odd, cos, sin, dtype, *, fuse_layout=True):
     """Map HY4's even/odd input to CANN half layout and retain its output order."""
-    packed = torch.cat((even, odd), -1)
-    rows = packed.shape[0]
+    layout = None
+    if fuse_layout:
+        from .rope_layout import pack_rope_inputs
+
+        layout = pack_rope_inputs(even, odd, cos, sin)
+    if layout is None:
+        packed = torch.cat((even, odd), -1)
+        rows = packed.shape[0]
+        width = packed.shape[-1]
+        packed_cos = torch.cat((cos, cos), -1).reshape(rows, 1, 1, width)
+        packed_sin = torch.cat((sin, sin), -1).reshape(rows, 1, 1, width)
+    else:
+        packed, packed_cos, packed_sin = layout
+        rows, width = packed.shape[0], packed.shape[-1]
     heads = packed.shape[1] if packed.ndim == 3 else 1
-    width = packed.shape[-1]
     rotated = torch_npu.npu_rotary_mul(
         packed.reshape(rows, 1, heads, width),
-        torch.cat((cos, cos), -1).reshape(rows, 1, 1, width),
-        torch.cat((sin, sin), -1).reshape(rows, 1, 1, width),
+        packed_cos,
+        packed_sin,
         rotary_mode="half",
     ).reshape_as(packed)
     return torch.cat((nope, rotated.to(dtype)), -1)
@@ -527,3 +613,57 @@ def sparse_lengths(num_pages, queries, length, device):
         ("c8_sparse_lengths", num_pages, queries, length),
         lambda: _make_sparse_lengths(num_pages, queries, length, device),
     )
+
+
+HEADS_PER_PROGRAM = 8
+
+
+@triton.jit
+def _sink_context_kernel(
+    context,
+    lse,
+    sink,
+    selected,
+    output,
+    heads: tl.constexpr,
+    width: tl.constexpr,
+    candidates: tl.constexpr,
+    candidate_block: tl.constexpr,
+    head_block: tl.constexpr,
+    value_block: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1) * head_block + tl.arange(0, head_block)
+    col = tl.arange(0, value_block)
+    valid_head = head < heads
+    index = tl.arange(0, candidate_block)
+    position = tl.load(selected + row * candidates + index, index < candidates, -1)
+    valid_row = tl.sum((position >= 0).to(tl.int32), 0) > 0
+    normalization = tl.load(lse + row * heads + head, valid_head, 0).to(tl.float32)
+    bias = tl.load(sink + head, valid_head, 0).to(tl.float32)
+    ratio = tl.sigmoid(normalization - bias)
+    offset = (row * heads + head[:, None]) * width + col[None, :]
+    live = valid_head[:, None] & (col[None, :] < width)
+    value = tl.load(context + offset, live, 0).to(tl.float32)
+    corrected = tl.where(valid_row, value * ratio[:, None], 0.0)
+    tl.store(output + offset, corrected, live)
+
+
+def fused_sink_context(context, lse, sink, selected):
+    rows, heads, width = context.shape
+    output = torch.empty(context.shape, device=context.device, dtype=context.dtype)
+    _sink_context_kernel[(rows, triton.cdiv(heads, HEADS_PER_PROGRAM))](
+        context.contiguous(),
+        lse.reshape(rows, heads).contiguous(),
+        sink.contiguous(),
+        selected.contiguous(),
+        output,
+        heads,
+        width,
+        selected.shape[-1],
+        triton.next_power_of_2(selected.shape[-1]),
+        HEADS_PER_PROGRAM,
+        triton.next_power_of_2(width),
+        enable_fp_fusion=False,
+    )
+    return output

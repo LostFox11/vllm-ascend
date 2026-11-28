@@ -202,10 +202,33 @@ class AscendHYV4FlashModel(HYV4FlashModel):
         }
         if pipeline_parallel:
             self._init_stage_engram(vllm_config, prefix)
+        self._bind_layer_metadata()
         self.uses_dfly = vllm_config.speculative_config is not None
         self._engram_prefetch_stream = None
         if self.engram_hash is not None:
             self.engram_hash.use_fused_prefill = is_950() and uses_prefill_ops(vllm_config)
+
+    def _bind_layer_metadata(self):
+        last_layer_name = None
+        for layer in self.layers:
+            attention = getattr(layer, "self_attn", None)
+            if attention is None:
+                continue
+            layer_name = attention.layer_name
+            last_layer_name = layer_name
+            for hc in (layer.hc_attn_layer, layer.hc_mlp_layer):
+                hc.metadata_layer_name = layer_name
+                if hc.enable_ihc:
+                    hc.hc_pre.metadata_layer_name = layer_name
+            if isinstance(layer.mlp, AscendFlashMoE):
+                layer.mlp.metadata_layer_name = layer_name
+                layer.mlp.gate.metadata_layer_name = layer_name
+            engram = getattr(layer, "engram_layer", None)
+            if engram is not None:
+                engram.metadata_layer_name = layer_name
+        head = getattr(self, "hc_head", None)
+        if isinstance(head, FlashHCHeadLayer):
+            head.metadata_layer_name = last_layer_name
 
     def _init_stage_engram(self, vllm_config, prefix):
         config = self.config
@@ -434,10 +457,11 @@ class AscendHYV4FlashForCausalLM(HYV4FlashForCausalLM):
 
     def load_weights(self, weights):
         loaded = super().load_weights(weights)
-        if self._pack_prefill_engram_weights:
-            for module in self.model.modules():
-                if isinstance(module, FlashEngram):
+        for module in self.model.modules():
+            if isinstance(module, FlashEngram):
+                if self._pack_prefill_engram_weights:
                     module.pack_prefill_weights()
+                module.pack_decode_weights()
         return loaded
 
     @staticmethod

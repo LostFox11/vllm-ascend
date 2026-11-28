@@ -524,3 +524,103 @@ def write_c8_rows(cache, slots, latent, rope, scales, keys=None, positions=None)
         _POSITIONS_END,
         num_warps=1,
     )
+
+
+@triton.jit
+def _compact_c8_positions_and_mask(
+    positions, output, mask, candidates: tl.constexpr, input_stride: tl.constexpr, block: tl.constexpr
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, block)
+    value = tl.load(positions + row * input_stride + col, col < candidates, -1)
+    valid = (col < candidates) & (value >= 0)
+    destination = tl.cumsum(valid.to(tl.int32), 0) - 1
+    count = tl.sum(valid.to(tl.int32), 0)
+    tl.store(output + row * candidates + col, -1, (col < candidates) & (col >= count))
+    tl.store(output + row * candidates + destination, value, valid)
+    tl.store(mask + row * candidates + col, col >= count, col < candidates)
+
+
+def empty_packed_c8_rows(queries, candidates, device):
+    from .fia_lengths import PackedC8KV
+
+    return PackedC8KV(
+        torch.empty((queries, candidates, _LATENT + _ROPE), dtype=torch.bfloat16, device=device),
+        torch.empty((queries, 1, 1, candidates), dtype=torch.bool, device=device),
+    )
+
+
+def gather_compact_c8_packed_rows(cache, block_table, block_size, positions, *, output=None):
+    """Read stable-packed BF16 KV for the CANN FIA input adapter."""
+    from .fia_lengths import PackedC8KV
+
+    queries, candidates = positions.shape
+    if output is None:
+        output = empty_packed_c8_rows(queries, candidates, cache.device)
+    values, mask = output
+    if (
+        values.shape != (queries, candidates, _LATENT + _ROPE)
+        or mask.shape != (queries, 1, 1, candidates)
+        or values.dtype != torch.bfloat16
+        or mask.dtype != torch.bool
+        or values.device != cache.device
+        or mask.device != cache.device
+        or not values.is_contiguous()
+        or not mask.is_contiguous()
+    ):
+        raise ValueError("Packed C8 output must be contiguous BF16 KV and a matching boolean mask")
+    use_direct_layout = (
+        cache.device.type == "npu"
+        and cache.ndim == 2
+        and cache.dtype == torch.uint8
+        and cache.is_contiguous()
+        and cache.shape[-1] >= _LATENT + 2 * _ROPE + 4 * (_LATENT // SFA_QSFA_TILE_SIZE)
+        and cache.shape[-1] % 4 == 0
+        and cache.storage_offset() % 4 == 0
+        and block_size > 0
+        and block_table.ndim == 1
+        and block_table.is_contiguous()
+        and block_table.dtype in (torch.int32, torch.int64)
+        and block_table.device == cache.device
+        and positions.device == cache.device
+        and positions.stride(1) == 1
+        and positions.dtype in (torch.int32, torch.int64)
+        and candidates <= _MAX_COMPACT_CANDIDATES
+    )
+    if not use_direct_layout:
+        # Retain the original compaction/dequantization implementation.
+        legacy = gather_compact_c8_rows(cache, block_table, block_size, positions)
+        values.copy_(torch.cat((legacy.nope[:, :, 0], legacy.rope[:, :, 0]), dim=-1))
+        mask.copy_(legacy.mask)
+        return PackedC8KV(values, mask)
+    packed = torch.empty((queries, candidates), dtype=positions.dtype, device=positions.device)
+    if queries and candidates:
+        _compact_c8_positions_and_mask[(queries,)](
+            positions,
+            packed,
+            mask,
+            candidates,
+            positions.stride(0),
+            triton.next_power_of_2(candidates),
+            num_warps=1,
+        )
+        # Retain FP32 dequantization, then round once on the BF16 output store.
+        _read_c8_rows[(triton.cdiv(packed.numel(), _ROWS_PER_PROGRAM),)](
+            cache,
+            cache.view(torch.bfloat16),
+            cache.view(torch.float32),
+            block_table,
+            packed,
+            values,
+            packed.numel(),
+            cache.shape[-1],
+            block_size,
+            _LATENT,
+            _ROPE,
+            SFA_QSFA_TILE_SIZE,
+            _ROWS_PER_PROGRAM,
+            num_warps=1,
+            enable_fp_fusion=False,
+            enable_graph_optimize=False,
+        )
+    return PackedC8KV(values, mask)
