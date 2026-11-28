@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_ascend.models.hy_v4_flash import attention_fusions, decode_fusions
+from vllm_ascend.models.hy_v4_flash import decode_fusions
 from vllm_ascend.models.hy_v4_flash.fia_lengths import FIALengthProvider, compact_fia_rows
 
 
@@ -73,7 +73,13 @@ def test_fp32_attention_preserves_kv_and_sink(tuple_kv):
     scale = 0.04
     rows = (kv[..., :512, None].transpose(-1, -2), kv[..., 512:, None].transpose(-1, -2), None) if tuple_kv else kv
     result = decode_fusions.native_mla_context(
-        query, selected, rows, sink, scale, length_provider=None, metadata=None,
+        query,
+        selected,
+        rows,
+        sink,
+        scale,
+        length_provider=None,
+        metadata=None,
     )
     logits = (query.float() @ kv.transpose(-1, -2) * scale).masked_fill(selected[:, None] < 0, -torch.inf)
     denominator = torch.cat((logits, sink[None, :, None].expand(3, -1, -1)), -1).softmax(-1)

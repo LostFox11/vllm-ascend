@@ -11,6 +11,67 @@ from vllm_ascend.models.hy_v4_flash.fia_lengths import CompactFIAKV, PackedC8KV
 from vllm_ascend.models.hy_v4_flash.rope_layout import pack_rope_inputs
 
 
+@pytest.mark.parametrize("layout", ["dense", "compact", "packed"])
+def test_native_fia_adapter_accepts_shared_compaction_layout(layout):
+    from vllm_ascend.models.hy_v4_flash.decode_fusions import _fia_kv_inputs
+    from vllm_ascend.models.hy_v4_flash.kv_compaction import CompactKV, compact_kv_rows
+
+    selected = torch.tensor([[-1, 3, -1, 7]])
+    values = torch.arange(4 * 576).reshape(1, 4, 576).float()
+    query = torch.zeros(1, 2, 576, dtype=torch.bfloat16)
+    nope, rope = compact_kv_rows(selected, values[:, :, None, :512], values[:, :, None, 512:])
+    mask = torch.tensor([[[[False, False, True, True]]]])
+    if layout == "compact":
+        rows = CompactKV(nope, rope, mask)
+    elif layout == "packed":
+        rows = PackedC8KV(torch.cat((nope[:, :, 0], rope[:, :, 0]), -1).bfloat16(), mask)
+    else:
+        rows = values
+    actual_nope, actual_rope = _fia_kv_inputs(query, selected, rows)
+    torch.testing.assert_close(actual_nope, nope.bfloat16(), rtol=0, atol=0)
+    torch.testing.assert_close(actual_rope, rope.bfloat16(), rtol=0, atol=0)
+    assert actual_nope.is_contiguous() and actual_rope.is_contiguous()
+
+
+def test_restored_native_attention_dispatches_to_cann_with_host_lengths(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_ascend.models.hy_v4_flash import attention_fusions, decode_fusions
+    from vllm_ascend.models.hy_v4_flash.fia_lengths import FIALengthProvider
+
+    tensor = torch.zeros(1, 2, 576, dtype=torch.bfloat16)
+
+    class NativeQuery:
+        device = SimpleNamespace(type="npu")
+        dtype = tensor.dtype
+        shape = tensor.shape
+
+        def __getitem__(self, index):
+            return tensor[index]
+
+    selected = torch.tensor([[-1, 0, 1, 2]])
+    kv = torch.zeros(1, 4, 576, dtype=torch.float32)
+    metadata = SimpleNamespace(seq_lens=[3], query_start_loc=[0, 1])
+    provider = FIALengthProvider("layer", 0, 1, 4, 512)
+    calls = []
+
+    def native_op(**kwargs):
+        calls.append(kwargs)
+        return torch.ones(1, 1, 2, 512, dtype=torch.bfloat16), torch.zeros(1, 2, 1, 1)
+
+    monkeypatch.setattr(torch.npu, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(decode_fusions.torch_npu, "npu_fused_infer_attention_score_v2", native_op)
+    monkeypatch.setattr(attention_fusions, "fused_sink_context", lambda context, *args: context)
+    result = native_mla_context(
+        NativeQuery(), selected, kv, torch.zeros(2), 1.0, length_provider=provider, metadata=metadata
+    )
+    assert result.shape == (1, 2, 512)
+    assert len(calls) == 1
+    assert calls[0]["actual_seq_kvlen"] == [3]
+    assert calls[0]["key"].dtype == torch.bfloat16
+    assert calls[0]["return_softmax_lse"] is True
+
+
 @pytest.mark.parametrize("with_scores", [False, True])
 @pytest.mark.parametrize("empty_row", [False, True])
 def test_packed_c8_keeps_mask_and_precomputed_score_permutation(with_scores, empty_row):
@@ -40,8 +101,8 @@ def test_attention_reader_selection_keeps_original_fallback(enabled):
     torch.nn.Module.__init__(layer)
     layer.fuse_decode_c8_layout = enabled
     allocate, read = layer._decode_c8_reader()
-    assert allocate is (c8_read.empty_packed_c8_rows if enabled else c8_read.empty_compact_c8_fia_rows)
-    assert read is (c8_read.gather_compact_c8_packed_rows if enabled else c8_read.gather_compact_c8_fia_rows)
+    assert allocate is (c8_read.empty_packed_c8_rows if enabled else c8_read.empty_compact_c8_rows)
+    assert read is (c8_read.gather_compact_c8_packed_rows if enabled else c8_read.gather_compact_c8_rows)
 
 
 def test_packed_c8_rejects_invalid_output_without_launching():

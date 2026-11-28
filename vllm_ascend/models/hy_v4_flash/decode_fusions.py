@@ -55,7 +55,9 @@ def _fia_kv_inputs(query, selected, kv):
     return nope.contiguous(), rope.contiguous()
 
 
-def native_mla_context(query, selected, kv, sink, scale, *, length_provider, metadata, scores=None, query_fp32=None):
+def native_mla_context(
+    query, selected, kv, sink, scale, *, length_provider=None, metadata=None, scores=None, query_fp32=None
+):
     """Run CANN FIA; retain fused sink correction and updatable graph tasks."""
     if query.device.type != "npu":
         return _reference_mla_context(

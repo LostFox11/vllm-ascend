@@ -5,6 +5,12 @@ throughput on the AISBench workload below and **30/30 correct (100%)** on
 AIME2026. These are separate workloads on the same source candidate. There
 is no paired baseline measurement establishing an optimization speedup.
 
+These hardware results apply to the container candidate imported in commit
+`267c9a373b4c4feb6b0391a972e6aa6f9b702858`, before integration with newer
+`Hy4-flash-opti` commits. See [integration notes](INTEGRATION.md) for the
+resolved differences and validation of the combined source. The combined
+source has not been rerun for full-model accuracy or throughput.
+
 ## Source and deployment
 
 - Server: `141.61.81.118`.

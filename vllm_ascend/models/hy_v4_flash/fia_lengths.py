@@ -7,13 +7,10 @@ from typing import NamedTuple
 
 import torch
 
+from .kv_compaction import CompactKV as CompactFIAKV
+from .kv_compaction import compact_kv_rows as compact_fia_rows
 
-class CompactFIAKV(NamedTuple):
-    """Reader output whose valid rows already form a stable prefix."""
-
-    nope: torch.Tensor
-    rope: torch.Tensor
-    mask: torch.Tensor
+__all__ = ["CompactFIAKV", "FIALengthProvider", "PackedC8KV", "compact_fia_rows"]
 
 
 class PackedC8KV(NamedTuple):
@@ -59,22 +56,3 @@ class FIALengthProvider:
                 length = visible + 1
             lengths.append(max(1, min(length, self.capacity)))
         return {"actual_seq_kvlen": lengths}
-
-
-def compact_fia_rows(selected, nope, rope):
-    """Stable-pack valid KV rows before supplying lengths instead of a mask.
-
-    Sliding windows have leading padding; sparse selections can have internal
-    holes. Dropping the mask without this permutation changes attention.
-    All operations stay on device and are capturable.
-    """
-    import torch
-
-    order = torch.argsort((selected < 0).to(torch.int32), dim=-1, stable=True)
-    valid = selected.gather(1, order) >= 0
-
-    def pack(value):
-        index = order[:, :, None, None].expand(-1, -1, value.shape[2], value.shape[3])
-        return torch.gather(value, 1, index).masked_fill(~valid[:, :, None, None], 0).contiguous()
-
-    return pack(nope), pack(rope)
