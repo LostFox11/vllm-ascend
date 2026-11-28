@@ -5,16 +5,17 @@
 import pytest
 import torch
 
-from vllm_ascend.models.hy_v4_flash import attention, c8_read
-from vllm_ascend.models.hy_v4_flash.decode_fusions import native_mla_context
+from vllm_ascend.models.hy_v4_flash import attention
+from vllm_ascend.models.hy_v4_flash import cache as cache_ops
+from vllm_ascend.models.hy_v4_flash.attention_ops import native_mla_context
 from vllm_ascend.models.hy_v4_flash.fia_lengths import CompactFIAKV, PackedC8KV
 from vllm_ascend.models.hy_v4_flash.rope_layout import pack_rope_inputs
 
 
 @pytest.mark.parametrize("layout", ["dense", "compact", "packed"])
 def test_native_fia_adapter_accepts_shared_compaction_layout(layout):
-    from vllm_ascend.models.hy_v4_flash.decode_fusions import _fia_kv_inputs
-    from vllm_ascend.models.hy_v4_flash.kv_compaction import CompactKV, compact_kv_rows
+    from vllm_ascend.models.hy_v4_flash.attention_ops import _fia_kv_inputs
+    from vllm_ascend.models.hy_v4_flash.cache import CompactKV, compact_kv_rows
 
     selected = torch.tensor([[-1, 3, -1, 7]])
     values = torch.arange(4 * 576).reshape(1, 4, 576).float()
@@ -36,7 +37,7 @@ def test_native_fia_adapter_accepts_shared_compaction_layout(layout):
 def test_restored_native_attention_dispatches_to_cann_with_host_lengths(monkeypatch):
     from types import SimpleNamespace
 
-    from vllm_ascend.models.hy_v4_flash import attention_fusions, decode_fusions
+    from vllm_ascend.models.hy_v4_flash import attention_ops
     from vllm_ascend.models.hy_v4_flash.fia_lengths import FIALengthProvider
 
     tensor = torch.zeros(1, 2, 576, dtype=torch.bfloat16)
@@ -60,8 +61,8 @@ def test_restored_native_attention_dispatches_to_cann_with_host_lengths(monkeypa
         return torch.ones(1, 1, 2, 512, dtype=torch.bfloat16), torch.zeros(1, 2, 1, 1)
 
     monkeypatch.setattr(torch.npu, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(decode_fusions.torch_npu, "npu_fused_infer_attention_score_v2", native_op)
-    monkeypatch.setattr(attention_fusions, "fused_sink_context", lambda context, *args: context)
+    monkeypatch.setattr(attention_ops.torch_npu, "npu_fused_infer_attention_score_v2", native_op)
+    monkeypatch.setattr(attention_ops, "fused_sink_context", lambda context, *args: context)
     result = native_mla_context(
         NativeQuery(), selected, kv, torch.zeros(2), 1.0, length_provider=provider, metadata=metadata
     )
@@ -101,8 +102,8 @@ def test_attention_reader_selection_keeps_original_fallback(enabled):
     torch.nn.Module.__init__(layer)
     layer.fuse_decode_c8_layout = enabled
     allocate, read = layer._decode_c8_reader()
-    assert allocate is (c8_read.empty_packed_c8_rows if enabled else c8_read.empty_compact_c8_rows)
-    assert read is (c8_read.gather_compact_c8_packed_rows if enabled else c8_read.gather_compact_c8_rows)
+    assert allocate is (cache_ops.empty_packed_c8_rows if enabled else cache_ops.empty_compact_c8_rows)
+    assert read is (cache_ops.gather_compact_c8_packed_rows if enabled else cache_ops.gather_compact_c8_rows)
 
 
 def test_packed_c8_rejects_invalid_output_without_launching():
@@ -111,7 +112,7 @@ def test_packed_c8_rejects_invalid_output_without_launching():
     selected = torch.zeros(1, 8, dtype=torch.int32)
     output = (torch.empty(1, 8, 576, dtype=torch.float64), torch.empty(1, 1, 1, 8, dtype=torch.bool))
     with pytest.raises(ValueError, match="contiguous BF16 KV"):
-        c8_read.gather_compact_c8_packed_rows(cache, table, 64, selected, output=output)
+        cache_ops.gather_compact_c8_packed_rows(cache, table, 64, selected, output=output)
 
 
 def test_rope_cpu_inputs_select_original_cat_path():

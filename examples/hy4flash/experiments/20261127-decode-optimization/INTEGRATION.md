@@ -2,12 +2,23 @@
 
 ## Target revision and conflict resolutions
 
-Integrated target revision `e0bf79ae1` and its preceding changes:
+Integrated target revision `c529feb98` and its preceding changes:
 
 - `1bec7f497`: the original precision-fix PR was already merged by the target.
 - `cb8d877e8`: paged IndexPool and compact C8 Decode paths.
 - `adb9c45a7`: pipeline-parallel eager Prefill and companion vLLM patch.
 - `e0bf79ae1`: Attention common/eager/Decode modules and operator cleanup.
+- `4911ae6b7`: consolidate operators into component modules.
+- `d3b4f6434`: align paged IndexPool tests with the scoring API.
+- `c529feb98`: keep shared cache configuration imports lightweight.
+
+The latest conflict resolution moves the imported native attention/sink,
+packed C8 reader and Engram gate kernels into `attention_ops.py`, `cache.py`
+and `engram_ops.py`. Deleted operator modules are not restored. Associated
+production imports and test patch targets follow the component layout.
+Five moved kernel/helper implementations were checked against the preceding
+integrated source: parsed ASTs are identical. The target's lightweight
+shared cache configuration imports are unchanged.
 
 The integration retains the target's Attention mixins, paged IndexPool,
 compact C8 sparse/window branches, pipeline-parallel stage ownership and
@@ -43,7 +54,7 @@ not restarted or rebound during the integration.
   `TRITON_INTERPRET=1` and `TORCH_DEVICE_BACKEND_AUTOLOAD=0`. This includes
   pipeline Prefill tests, per-layer metadata, packed projection, fallback,
   compaction/host-length tests, and a mocked native CANN dispatch regression.
-- Ruff check and Ruff formatting check: **passed**, 89 Python files checked
+- Ruff check and Ruff formatting check: **passed**, 44 Python files checked
   for formatting in the model package and HY4 unit tests.
 - Markdown lint and `git diff --check`: **passed**.
 - `bash format.sh ci`: attempted with a 30-second timeout; the first
@@ -52,6 +63,9 @@ not restarted or rebound during the integration.
 - The first broader test run exposed a pre-existing test mock using the old
   zero-argument metadata lookup. The fixture now accepts the layer name;
   production metadata selection remains per-layer.
+- The component consolidation initially exposed a module/local-variable name
+  collision in one test; the module now has an explicit alias. No production
+  computation change was needed for that fixture fix.
 
 These CPU and mocked checks do not establish native NPU graph replay or
 full-model accuracy/throughput for the integrated revision. Integration

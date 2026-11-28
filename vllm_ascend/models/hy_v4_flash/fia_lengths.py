@@ -7,8 +7,8 @@ from typing import NamedTuple
 
 import torch
 
-from .kv_compaction import CompactKV as CompactFIAKV
-from .kv_compaction import compact_kv_rows as compact_fia_rows
+from .cache import CompactKV as CompactFIAKV
+from .cache import compact_kv_rows as compact_fia_rows
 
 __all__ = ["CompactFIAKV", "FIALengthProvider", "PackedC8KV", "compact_fia_rows"]
 

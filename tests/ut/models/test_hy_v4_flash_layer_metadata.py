@@ -73,13 +73,13 @@ def test_native_context_receives_own_cache_group_metadata(layer_context, monkeyp
 
 
 def test_indexpool_encoding_selects_own_layer(layer_context, monkeypatch):
-    from vllm_ascend.models.hy_v4_flash import index_pool_fp8
+    from vllm_ascend.models.hy_v4_flash import indexer
 
     pool = attention.FlashIndexPool.__new__(attention.FlashIndexPool)
     torch.nn.Module.__init__(pool)
     pool.metadata_layer_name = "layers.8.attn"
     encode = Mock(return_value="decode-fp8")
-    monkeypatch.setattr(index_pool_fp8, "encode_indexpool_fp8_fused", encode)
+    monkeypatch.setattr(indexer, "encode_indexpool_fp8_fused", encode)
     vectors = torch.zeros(2, 128)
     assert pool._encode_fp8(vectors, full_graph=True) == "decode-fp8"
     encode.assert_called_once_with(vectors)

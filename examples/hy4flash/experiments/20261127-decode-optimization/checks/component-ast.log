@@ -1,0 +1,5 @@
+AST unchanged: _norm_dot_gate_many_kernel
+AST unchanged: fused_norm_dot_gates
+AST unchanged: _compact_c8_positions_and_mask
+AST unchanged: gather_compact_c8_packed_rows
+AST unchanged: _sink_context_kernel

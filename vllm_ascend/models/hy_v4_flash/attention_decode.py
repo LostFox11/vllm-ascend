@@ -12,20 +12,18 @@ from vllm.models.hy_v4_flash.reference import (
 from vllm_ascend.hisparse.c8 import C8_ROW_BYTES, dequantize_c8_rows
 from vllm_ascend.logger import init_logger_ascend
 
-from . import triton_ops
-from .attention_common import (
+from . import ops as triton_ops
+from .attention_ops import (
     BATCH_VERIFY_MAX_QUERIES,
     BATCH_VERIFY_SPARSE_SHAPE,
     BATCH_VERIFY_SWA_SHAPE,
     PAGED_POOL_DECODE_SHAPE,
     _head_bmm,
-)
-from .decode_fusions import (
     native_indexpool_select,
     native_mla_context,
     prepare_indexpool_selection,
 )
-from .index_pool_select import select_pool_candidates, write_pool_scores
+from .indexer import select_pool_candidates, write_pool_scores
 
 logger = init_logger_ascend(__name__)
 
@@ -144,7 +142,7 @@ class DecodeAttentionMixin:
             and query.dtype == torch.bfloat16
             and query.device.type == "npu"
         ):
-            from .c8_decode import attend_compact_c8
+            from .c8_attention import attend_compact_c8
 
             lane = torch.arange(window, device=query.device)
             lengths = (logical + 1).clamp(0, window)
@@ -297,7 +295,7 @@ class DecodeAttentionMixin:
                         scores[request],
                     )
             if self.decode_index_pages is not None:
-                from .index_pool_decode import select_pages
+                from .indexer import select_pages
 
                 batched_selected = select_pages(
                     index_query,
@@ -399,7 +397,7 @@ class DecodeAttentionMixin:
                 and num_queries == BATCH_VERIFY_MAX_QUERIES
                 and selected.shape[-1] == 2048
             ):
-                from .c8_decode import attend_compact_c8
+                from .c8_attention import attend_compact_c8
 
                 packed = self._gather(cache, table, block_size, selected.clamp_min(0), slice(C8_ROW_BYTES))
                 context = attend_compact_c8(query[start:stop], packed, selected, self.learnable_sink_param, self.scale)
@@ -436,7 +434,7 @@ class DecodeAttentionMixin:
             selected = torch.stack(sparse_selected)
             selected = selected.flatten(0, 1)
             if self.cann_c8_decode:
-                from .c8_decode import attend_compact_c8
+                from .c8_attention import attend_compact_c8
 
                 packed = self._gather(
                     cache,
@@ -496,7 +494,7 @@ class DecodeAttentionMixin:
         keys = self.indexer.encode_keys(raw, key_pos, full_graph=True)
         self.ops.copy_pool_keys(cache, table, keys, first, block_size, ratio, write=True, end_group=end)
         if self.decode_index_pages is not None:
-            from .index_pool_decode import write_pages
+            from .indexer import write_pages
 
             write_pages(keys, self.decode_index_pages, table, first, end, block_size)
 
