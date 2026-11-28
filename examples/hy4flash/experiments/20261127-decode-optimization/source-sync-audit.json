@@ -1,0 +1,72 @@
+[
+  {
+    "path": "vllm_ascend/models/hy_v4_flash/attention.py",
+    "container_sha256": "31d8ef0b3857eb4563b96daec6ec06863d06207b516a7182f74be083b9816b56",
+    "submission_sha256": "31d8ef0b3857eb4563b96daec6ec06863d06207b516a7182f74be083b9816b56",
+    "byte_identical": true,
+    "note": "Copied from measured container source"
+  },
+  {
+    "path": "vllm_ascend/models/hy_v4_flash/c8_read.py",
+    "container_sha256": "e75ad8542a8877553fa19829f88dad15b172397c087c1156264958673d57fc1f",
+    "submission_sha256": "e75ad8542a8877553fa19829f88dad15b172397c087c1156264958673d57fc1f",
+    "byte_identical": true,
+    "note": "Copied from measured container source"
+  },
+  {
+    "path": "vllm_ascend/models/hy_v4_flash/decode_fusions.py",
+    "container_sha256": "4eaacd41bed78dafe3d8ee8630d30e743ef58abd8a9294618dcc278d6d50375a",
+    "submission_sha256": "6fc16e11fcd79b85a6a6218c6f5bc9aef27504ca9bc2328ee7bbebf17a564fb6",
+    "byte_identical": false,
+    "note": "Ruff formatting only; AST equality verified"
+  },
+  {
+    "path": "vllm_ascend/models/hy_v4_flash/engram.py",
+    "container_sha256": "bcaa1290e3b5ad42b2a0fa03d5189bc087e39a11f205a3bedcc02c8756d47a7c",
+    "submission_sha256": "bcaa1290e3b5ad42b2a0fa03d5189bc087e39a11f205a3bedcc02c8756d47a7c",
+    "byte_identical": true,
+    "note": "Copied from measured container source"
+  },
+  {
+    "path": "vllm_ascend/models/hy_v4_flash/engram_fusions.py",
+    "container_sha256": "cf6ab6afe1c736cf739a62ca15cb3669030fa6be0c2fe438bc64f8573161b555",
+    "submission_sha256": "cf6ab6afe1c736cf739a62ca15cb3669030fa6be0c2fe438bc64f8573161b555",
+    "byte_identical": true,
+    "note": "Copied from measured container source"
+  },
+  {
+    "path": "vllm_ascend/models/hy_v4_flash/fia_lengths.py",
+    "container_sha256": "d5309e46faaaf4ca67338c9b664481aaed047cb44abe59a892893930fbc89a19",
+    "submission_sha256": "d5309e46faaaf4ca67338c9b664481aaed047cb44abe59a892893930fbc89a19",
+    "byte_identical": true,
+    "note": "Copied from measured container source"
+  },
+  {
+    "path": "vllm_ascend/models/hy_v4_flash/ihc.py",
+    "container_sha256": "4c0341807ace93d38df677066e425c51071196b29d89af9449436bce64c5ad46",
+    "submission_sha256": "4c0341807ace93d38df677066e425c51071196b29d89af9449436bce64c5ad46",
+    "byte_identical": true,
+    "note": "Copied from measured container source"
+  },
+  {
+    "path": "vllm_ascend/models/hy_v4_flash/model.py",
+    "container_sha256": "dafbcc35010aeaeb62dfe073564b203df34c86e6833da71a1f83db325cfd1f8a",
+    "submission_sha256": "dafbcc35010aeaeb62dfe073564b203df34c86e6833da71a1f83db325cfd1f8a",
+    "byte_identical": true,
+    "note": "Copied from measured container source"
+  },
+  {
+    "path": "vllm_ascend/models/hy_v4_flash/moe.py",
+    "container_sha256": "b7c28bb5fd7aea765f54815429a2548889bbd2dcc329010c897f28bb26a90dcf",
+    "submission_sha256": "b7c28bb5fd7aea765f54815429a2548889bbd2dcc329010c897f28bb26a90dcf",
+    "byte_identical": true,
+    "note": "Copied from measured container source"
+  },
+  {
+    "path": "vllm_ascend/models/hy_v4_flash/rope_layout.py",
+    "container_sha256": "a6950fb1f326010fa3005f8d60f98f645b749d8586206d3f184cdb93a42f2ef0",
+    "submission_sha256": "a6950fb1f326010fa3005f8d60f98f645b749d8586206d3f184cdb93a42f2ef0",
+    "byte_identical": true,
+    "note": "Copied from measured container source"
+  }
+]

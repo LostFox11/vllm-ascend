@@ -1,0 +1,358 @@
+{
+  "dataset": "aime26",
+  "completed": 30,
+  "correct": 30,
+  "accuracy": 1.0,
+  "final_result": true,
+  "evalscope_version": "1.15.0",
+  "source": "/opt/hy4/validation/decode-layout-gate-fusion-20261127/source",
+  "config": {
+    "model_id": "hy4-flash",
+    "model_args": {},
+    "model_task": "text_generation",
+    "chat_template": null,
+    "datasets": [
+      "aime26"
+    ],
+    "dataset_args": {
+      "aime26": {
+        "local_path": "/opt/hy4-evalscope-night-1900-20261127/aime26-local"
+      }
+    },
+    "dataset_dir": "/root/.cache/modelscope/hub/datasets",
+    "dataset_hub": "modelscope",
+    "repeats": 1,
+    "eval_type": "openai_api",
+    "eval_backend": "Native",
+    "eval_config": null,
+    "limit": null,
+    "eval_batch_size": 16,
+    "use_cache": null,
+    "rerun_review": false,
+    "work_dir": "/opt/hy4-evalscope-night-1900-20261127/results",
+    "no_timestamp": false,
+    "enable_progress_tracker": false,
+    "ignore_errors": false,
+    "debug": false,
+    "dry_run": false,
+    "seed": 42,
+    "api_url": "http://172.17.0.2:19427/v1",
+    "api_key": "**********",
+    "timeout": null,
+    "stream": null,
+    "judge": {
+      "strategy": "auto",
+      "models": [],
+      "contract": {
+        "system_prompt": null,
+        "prompt_template": null,
+        "score_mapping": null,
+        "score_type": "pattern"
+      },
+      "repeats": 1,
+      "position_swap": "auto",
+      "aggregation": "mean",
+      "min_valid_judges": 1
+    },
+    "analysis_report": false,
+    "collect_perf": true,
+    "use_sandbox": false,
+    "sandbox_type": "docker",
+    "sandbox_manager_config": {},
+    "evalscope_version": "1.15.0",
+    "model": "hy4-flash",
+    "generation_config": {
+      "timeout": 14400.0,
+      "batch_size": 16,
+      "stream": true,
+      "top_p": 1.0,
+      "temperature": 0.9,
+      "top_k": -1
+    },
+    "sandbox": {
+      "enabled": false,
+      "engine": "docker",
+      "default_config": {},
+      "manager_config": {},
+      "pool_size": null
+    },
+    "agent_config": null
+  },
+  "status": {
+    "stage": "completed",
+    "started_at": 1795809077.8314211,
+    "updated_at": 1795810103.141261
+  },
+  "scores": [
+    {
+      "index": 0,
+      "target": [
+        "277"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "277"
+    },
+    {
+      "index": 1,
+      "target": [
+        "62"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "62"
+    },
+    {
+      "index": 2,
+      "target": [
+        "79"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "79"
+    },
+    {
+      "index": 3,
+      "target": [
+        "70"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "70"
+    },
+    {
+      "index": 4,
+      "target": [
+        "65"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "65"
+    },
+    {
+      "index": 5,
+      "target": [
+        "441"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "441"
+    },
+    {
+      "index": 6,
+      "target": [
+        "396"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "396"
+    },
+    {
+      "index": 7,
+      "target": [
+        "244"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "244"
+    },
+    {
+      "index": 8,
+      "target": [
+        "29"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "29"
+    },
+    {
+      "index": 9,
+      "target": [
+        "156"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "156"
+    },
+    {
+      "index": 10,
+      "target": [
+        "896"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "896"
+    },
+    {
+      "index": 11,
+      "target": [
+        "161"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "161"
+    },
+    {
+      "index": 12,
+      "target": [
+        "39"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "39"
+    },
+    {
+      "index": 13,
+      "target": [
+        "681"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "681"
+    },
+    {
+      "index": 14,
+      "target": [
+        "83"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "83"
+    },
+    {
+      "index": 15,
+      "target": [
+        "178"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "178"
+    },
+    {
+      "index": 16,
+      "target": [
+        "243"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "243"
+    },
+    {
+      "index": 17,
+      "target": [
+        "503"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "503"
+    },
+    {
+      "index": 18,
+      "target": [
+        "279"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "279"
+    },
+    {
+      "index": 19,
+      "target": [
+        "190"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "190"
+    },
+    {
+      "index": 20,
+      "target": [
+        "50"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "50"
+    },
+    {
+      "index": 21,
+      "target": [
+        "754"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "754"
+    },
+    {
+      "index": 22,
+      "target": [
+        "245"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "245"
+    },
+    {
+      "index": 23,
+      "target": [
+        "669"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "669"
+    },
+    {
+      "index": 24,
+      "target": [
+        "850"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "850"
+    },
+    {
+      "index": 25,
+      "target": [
+        "132"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "132"
+    },
+    {
+      "index": 26,
+      "target": [
+        "223"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "223"
+    },
+    {
+      "index": 27,
+      "target": [
+        "107"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "107"
+    },
+    {
+      "index": 28,
+      "target": [
+        "157"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "157"
+    },
+    {
+      "index": 29,
+      "target": [
+        "393"
+      ],
+      "accuracy": 1.0,
+      "status": "success",
+      "extracted_prediction": "393"
+    }
+  ]
+}

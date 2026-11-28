@@ -16,6 +16,13 @@ class CompactFIAKV(NamedTuple):
     mask: torch.Tensor
 
 
+class PackedC8KV(NamedTuple):
+    """Stable-packed BF16 [query, candidate, 576] KV with its invalid mask."""
+
+    values: torch.Tensor
+    mask: torch.Tensor
+
+
 @dataclass(frozen=True, eq=False)
 class FIALengthProvider:
     # Each captured call owns a provider, including repeated calls in one layer.

@@ -1,0 +1,30 @@
+{
+  "command": [
+    "python3",
+    "aisbench_test.py",
+    "--input_len",
+    "131072",
+    "--output_len",
+    "1024",
+    "--data_num",
+    "128",
+    "--request_rate",
+    "0",
+    "--concurrency",
+    "32",
+    "--seed",
+    "1024",
+    "--dataset_type",
+    "prefix_cache",
+    "--repeat_rate",
+    "0.90",
+    "--prefix_test"
+  ],
+  "cwd": "/home/d00943518/aisbench_auto_tools_prefix",
+  "env": {
+    "PYTHONPATH": "/opt/hy4/validation/decode-layout-gate-fusion-20261127/night-1900-20261127/aisbench",
+    "PATH": "/home/d00943518/aisbench_auto_tools_prefix/bin:/opt/hy4/bin:/root/.cargo/bin:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/cann-9.3.0/tools/bishengir/bin:/usr/local/Ascend/cann-9.3.0/bin:/usr/local/Ascend/cann-9.3.0/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.3.0/tools/profiler/bin:/usr/local/Ascend/cann-9.3.0/tools/ascend_system_advisor/asys:/usr/local/Ascend/cann-9.3.0/tools/show_kernel_debug_data:/usr/local/Ascend/cann-9.3.0/tools/msobjdump:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/opt/hy4/bin:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/python3.12.13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/bin",
+    "NO_PROXY": "*",
+    "QWEN_NATIVE_PERF_SUMMARY": "1"
+  }
+}

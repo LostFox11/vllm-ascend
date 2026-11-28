@@ -20,15 +20,9 @@ ROUTER_TILE_ROWS = 64
 
 
 def rounded_moe_add_rms_norm(shared, routed, norm):
-    """Retain the expert sum's dtype boundary before the fused normalization.
-
-    AddRmsNorm normalizes its unrounded accumulator, although its residual
-    output is rounded. HY4's reference normalizes the rounded expert sum.
-    Keep the CANN fused operator, supplying an already-rounded sum so both
-    its accumulator and residual observe the reference value.
-    """
+    """Keep the BF16 expert-sum boundary before the native RMSNorm."""
     combined = shared + routed
-    return torch_npu.npu_add_rms_norm(combined, torch.zeros_like(combined), norm.weight, norm.variance_epsilon)[0]
+    return torch_npu.npu_rms_norm(combined, norm.weight, norm.variance_epsilon)[0]
 
 
 class _RouterWeightPreparation:
@@ -52,6 +46,8 @@ class _AscendFlashRouterLinearMethod(_RouterWeightPreparation, AscendUnquantized
 
 
 class FlashGateLinear(GateLinear):
+    metadata_layer_name: str | None = None
+
     def enable_prefill_router(self):
         method = type(self.quant_method)
         if method is UnquantizedLinearMethod:
@@ -63,7 +59,7 @@ class FlashGateLinear(GateLinear):
         self.register_buffer("prefill_router_weight", None, persistent=False)
 
     def forward(self, x: torch.Tensor):
-        batch = get_flash_attention_metadata()
+        batch = get_flash_attention_metadata(self.metadata_layer_name)
         weight = getattr(self, "prefill_router_weight", None)
         if (
             weight is not None
@@ -94,6 +90,8 @@ class FlashGateLinear(GateLinear):
 
 
 class AscendFlashMoE(HYV4FlashMoE):
+    metadata_layer_name: str | None = None
+
     gate_cls = FlashGateLinear
 
     def __init__(self, config, quant_config, prefix):
@@ -116,7 +114,11 @@ class AscendFlashMoE(HYV4FlashMoE):
             self.gate.enable_prefill_router()
 
     def forward(self, hidden_states):
-        if not is_decode_batch(get_flash_attention_metadata()) or not is_950() or self.combine_output_norm is None:
+        if (
+            not is_decode_batch(get_flash_attention_metadata(self.metadata_layer_name))
+            or not is_950()
+            or self.combine_output_norm is None
+        ):
             return super().forward(hidden_states)
         original_shape = hidden_states.shape
         flat = hidden_states.reshape(-1, original_shape[-1])

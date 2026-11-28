@@ -209,6 +209,8 @@ def _encode_prefill_indexpool_fp8(vectors, *, output_dtype=torch.float32):
 
 
 class FlashIndexPool(nn.Module):
+    metadata_layer_name: str | None = None
+
     def __init__(
         self,
         config,
@@ -219,11 +221,14 @@ class FlashIndexPool(nn.Module):
         fuse_fp8_encoding=False,
         fp8_encoder=triton_ops.encode_indexpool_fp8,
         use_eager_fp8_encoding=False,
+        metadata_layer_name: str | None = None,
     ):
         super().__init__()
+        self.metadata_layer_name = metadata_layer_name
         self.fuse_fp8_encoding = fuse_fp8_encoding
         self.fp8_encoder = fp8_encoder
         self.use_eager_fp8_encoding = use_eager_fp8_encoding
+        self.fuse_decode_rope_layout = True
         self.ratio = config.compressed_indexer_compress_ratio
         self.budget = config.compressed_indexer_group_topk - 1
         self.num_heads = config.compressed_indexer_num_attention_heads
@@ -320,7 +325,7 @@ class FlashIndexPool(nn.Module):
         if normalization is not None:
             weight, multiplier = normalization
             vectors = ((vectors * multiplier[:, None]) * weight).bfloat16()
-        decode = is_decode_batch(get_flash_attention_metadata())
+        decode = is_decode_batch(get_flash_attention_metadata(self.metadata_layer_name))
         inverse = self._decode_inverse_frequency if decode else None
         if inverse is None:
             inverse = self.theta ** (
@@ -354,8 +359,20 @@ class FlashIndexPool(nn.Module):
         rotary_fp32 = rotary.float()
         even, odd = rotary_fp32[..., ::2], rotary_fp32[..., 1::2]
         cos, sin = phase.cos(), phase.sin()
-        if is_decode_batch(get_flash_attention_metadata()) and vectors.device.type == "npu" and is_950():
-            return native_indexpool_rope(nope, even, odd, cos, sin, vectors.dtype)
+        if (
+            is_decode_batch(get_flash_attention_metadata(self.metadata_layer_name))
+            and vectors.device.type == "npu"
+            and is_950()
+        ):
+            return native_indexpool_rope(
+                nope,
+                even,
+                odd,
+                cos,
+                sin,
+                vectors.dtype,
+                fuse_layout=getattr(self, "fuse_decode_rope_layout", False),
+            )
         return torch.cat(
             (
                 nope,
@@ -366,7 +383,7 @@ class FlashIndexPool(nn.Module):
         )
 
     def _encode_fp8(self, vectors, *, full_graph, output_dtype=torch.float32):
-        if is_decode_batch(get_flash_attention_metadata()):
+        if is_decode_batch(get_flash_attention_metadata(self.metadata_layer_name)):
             from .index_pool_fp8 import encode_indexpool_fp8_fused
 
             return encode_indexpool_fp8_fused(vectors)
@@ -417,7 +434,7 @@ class FlashIndexPool(nn.Module):
         raw = raw[: groups * self.ratio].reshape(groups, self.ratio, INDEX_DIM)
         if not groups:
             return raw.new_empty((0, INDEX_DIM), dtype=torch.float32)
-        decode_pool = is_decode_batch(get_flash_attention_metadata())
+        decode_pool = is_decode_batch(get_flash_attention_metadata(self.metadata_layer_name))
         if decode_pool:
             from .index_pool_fusions import pool_norm
 
@@ -494,6 +511,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         self._short_indexpool_capture = False
         self.native_decode_attention = not reuse_target and uses_decode_fusions(vllm_config)
         self.decode_data_fusions = self.native_decode_attention and HAS_TRITON
+        self.fuse_decode_c8_layout = self.decode_data_fusions
         self.bulk_c8_decode_reads = True
         self.ops = triton_ops
         if self.use_cann_prefill:
@@ -655,6 +673,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 quant,
                 rope_parameters,
                 f"{prefix}.indexer",
+                metadata_layer_name=self.layer_name,
                 fuse_fp8_encoding=use_a5_c8,
                 fp8_encoder=self.ops.encode_indexpool_fp8,
                 use_eager_fp8_encoding=(self.use_cann_prefill and use_a5_c8 and vllm_config.model_config.enforce_eager),
@@ -693,7 +712,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         q_a = self.q_a_proj(hidden_states)[0]
         scheme = getattr(self.q_b_proj.quant_method, "quant_method", None)
         if (
-            is_decode_batch(get_flash_attention_metadata())
+            is_decode_batch(get_flash_attention_metadata(self.layer_name))
             and is_950()
             and q_a.device.type == "npu"
             and q_a.dtype == self.q_a_layernorm.weight.dtype == torch.bfloat16
@@ -828,7 +847,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         return rope(positions, q_pe, k_pe)
 
     def forward(self, positions, hidden_states):
-        if self.native_decode_attention and is_decode_batch(get_flash_attention_metadata()):
+        if self.native_decode_attention and is_decode_batch(get_flash_attention_metadata(self.layer_name)):
             return self._forward_native_decode(positions, hidden_states)
         return self._forward_existing(positions, hidden_states)
 
@@ -842,7 +861,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         q_pe, k_pe = self._rotate_qk(positions, q_pe.reshape(q.shape[0], -1).contiguous(), k_pe.contiguous())
         q_pe = q_pe.reshape(-1, self.local_heads, self.rope_dim)
         needs_meta = self.use_cann_prefill or self.fuse_attn_output_gate or self.overlap_attn_output_gate
-        meta = get_flash_attention_metadata() if needs_meta else None
+        meta = get_flash_attention_metadata(self.layer_name) if needs_meta else None
         full_decode = meta is not None and meta.decode_seq_lens is not None
         full_prefill = (
             self.use_cann_prefill
@@ -1192,7 +1211,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         if self.topk_snapshot is not None:
             self.topk_snapshot[start:stop, : selected.shape[-1]].copy_(selected)
         if self._can_gather_decode_fia_rows(cache, query.dtype):
-            from .c8_read import gather_compact_c8_fia_rows as gather_c8_fia_rows
+            _, gather_c8_fia_rows = self._decode_c8_reader()
 
             rows = gather_c8_fia_rows(cache, table, block_size, selected)
         else:
@@ -1764,12 +1783,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 snapshot[:num_tokens, :window].copy_(selected)
             direct_fia = self._can_gather_decode_fia_rows(cache, query.dtype)
             if direct_fia:
-                from .c8_read import (
-                    empty_compact_c8_fia_rows as empty_c8_fia_rows,
-                )
-                from .c8_read import (
-                    gather_compact_c8_fia_rows as gather_c8_fia_rows,
-                )
+                empty_c8_fia_rows, gather_c8_fia_rows = self._decode_c8_reader()
 
                 rows = empty_c8_fia_rows(num_tokens, window, query.device)
                 for request in range(batch_size):
@@ -1953,7 +1967,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 continue
             q = query[start:stop]
             if self._can_gather_decode_fia_rows(cache, q.dtype):
-                from .c8_read import gather_compact_c8_fia_rows as gather_c8_fia_rows
+                _, gather_c8_fia_rows = self._decode_c8_reader()
 
                 rows = gather_c8_fia_rows(cache, table, block_size, selected)
             elif shared_positions is None:
@@ -1981,12 +1995,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             selected = torch.stack(sparse_selected)
             selected = selected.flatten(0, 1)
             if self._can_gather_decode_fia_rows(cache, query.dtype):
-                from .c8_read import (
-                    empty_compact_c8_fia_rows as empty_c8_fia_rows,
-                )
-                from .c8_read import (
-                    gather_compact_c8_fia_rows as gather_c8_fia_rows,
-                )
+                empty_c8_fia_rows, gather_c8_fia_rows = self._decode_c8_reader()
 
                 rows = empty_c8_fia_rows(num_tokens, selected.shape[-1], query.device)
                 for request in range(batch_size):
@@ -2048,6 +2057,18 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         history = history.masked_fill(history >= end * ratio, 0)
         raw, key_pos = self._read_index_rows(cache, table, block_size, history, position_ndim)
         return self.indexer.encode_keys(raw, key_pos, full_graph=True)
+
+    def _decode_c8_reader(self):
+        from .c8_read import (
+            empty_compact_c8_fia_rows,
+            empty_packed_c8_rows,
+            gather_compact_c8_fia_rows,
+            gather_compact_c8_packed_rows,
+        )
+
+        if getattr(self, "fuse_decode_c8_layout", False):
+            return empty_packed_c8_rows, gather_compact_c8_packed_rows
+        return empty_compact_c8_fia_rows, gather_compact_c8_fia_rows
 
     def _can_gather_decode_fia_rows(self, cache, output_dtype):
         return (
@@ -2334,7 +2355,10 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         graph_queries=None,
         fuse_prefill_logits=False,
     ):
-        if getattr(self, "native_decode_attention", False) and is_decode_batch(get_flash_attention_metadata()):
+        metadata = (
+            get_flash_attention_metadata(self.layer_name) if getattr(self, "native_decode_attention", False) else None
+        )
+        if is_decode_batch(metadata):
             context = native_mla_context(
                 query,
                 selected,
@@ -2342,7 +2366,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 self.learnable_sink_param,
                 self.scale,
                 length_provider=self._fia_length_provider(selected, token_start, graph_queries),
-                metadata=get_flash_attention_metadata(),
+                metadata=metadata,
                 scores=scores,
                 query_fp32=query_fp32,
             )

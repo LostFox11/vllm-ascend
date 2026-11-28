@@ -25,17 +25,18 @@ from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.device.device_config import is_950
 
+from .decode_fusions import uses_decode_fusions
 from .pd_role import uses_prefill_ops
 
 _CANN_ENGRAM_MAX_TOKENS = 512
 _CANN_RMS_ALIGNMENT = 32
 
 
-def _engram_inverse_rms(value, weight, epsilon, use_cann):
+def _engram_inverse_rms(value, weight, epsilon, use_cann, *, layer_name=None):
     from .attention import get_flash_attention_metadata
     from .decode_fusions import is_decode_batch
 
-    if is_decode_batch(get_flash_attention_metadata()):
+    if is_decode_batch(get_flash_attention_metadata(layer_name)):
         return torch_npu.npu_rms_norm(value, weight, epsilon)[1]
     if (
         use_cann
@@ -470,6 +471,8 @@ class FlashEmbedding(nn.Module):
 
 
 class FlashEngram(nn.Module):
+    metadata_layer_name: str | None = None
+
     def __init__(self, vllm_config, layout, layer_id, prefix):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -500,6 +503,15 @@ class FlashEngram(nn.Module):
         )
         self.hidden_size, self.hc_mult = config.hidden_size, config.hc_mult
         self._use_small_aiv = HAS_TRITON and is_950() and uses_prefill_ops(vllm_config)
+        self.use_packed_decode_projection = (
+            HAS_TRITON and uses_decode_fusions(vllm_config) and self.multi_head_embedding.tp_size == 1
+        )
+        self.register_buffer("_decode_kv_weight", None, persistent=False)
+        self.register_buffer("_decode_kv_bias", None, persistent=False)
+        self.use_fused_decode_gate = self.use_packed_decode_projection
+        self.register_buffer("_decode_gate_key_gamma", None, persistent=False)
+        self.register_buffer("_decode_gate_query_gamma", None, persistent=False)
+        self._decode_gate_eps = None
         self.register_buffer("_lookup_gamma", None, persistent=False)
         self.register_buffer("_key_gamma", None, persistent=False)
         self.register_buffer("_query_gamma", None, persistent=False)
@@ -530,11 +542,13 @@ class FlashEngram(nn.Module):
             set_weight_attrs(projection.bias, {"weight_loader": self._load_bias})
 
     def _load_projection(self, parameter, value):
+        self._invalidate_decode_weights()
         if value.shape != (self.hidden_size, self.total_width):
             raise ValueError("Flash Engram projection weight shape mismatch")
         default_weight_loader(parameter, value[:, self.start : self.stop])
 
     def _load_bias(self, parameter, value):
+        self._invalidate_decode_weights()
         default_weight_loader(parameter, value if self.rank == 0 else torch.zeros_like(value))
 
     @torch.no_grad()
@@ -556,6 +570,109 @@ class FlashEngram(nn.Module):
                     self._packed_kv_weight = torch.cat([p.weight for p in projections])
                     self._packed_kv_bias = torch.cat([p.bias for p in projections])
 
+    def _invalidate_decode_weights(self):
+        self._decode_kv_weight = None
+        self._decode_kv_bias = None
+        self._decode_gate_key_gamma = None
+        self._decode_gate_query_gamma = None
+        self._decode_gate_eps = None
+        self._decode_pack_constants = None
+
+    @torch.no_grad()
+    def pack_decode_weights(self):
+        """Pack TP1 BF16 projections after loading, before graph capture."""
+        self._invalidate_decode_weights()
+        if not self.use_packed_decode_projection or self.multi_head_embedding.tp_size != 1:
+            return
+        projections = (*self.key_projs, self.value_proj)
+        weight = self.value_proj.weight
+        if not all(
+            type(projection) is nn.Linear
+            and projection.weight.shape == (self.hidden_size, self.total_width)
+            and projection.weight.device == weight.device
+            and projection.weight.dtype == torch.bfloat16
+            and projection.weight.is_contiguous()
+            and projection.bias is not None
+            and projection.bias.shape == (self.hidden_size,)
+            and projection.bias.device == weight.device
+            and projection.bias.dtype == torch.bfloat16
+            and projection.bias.is_contiguous()
+            for projection in projections
+        ):
+            return
+        # Keep the original parameters and loaders for fallback and reload.
+        self._decode_kv_weight = torch.cat([projection.weight for projection in projections])
+        self._decode_kv_bias = torch.cat([projection.bias for projection in projections])
+        self._pack_decode_gate_weights()
+
+    def _pack_decode_gate_weights(self):
+        if not getattr(self, "use_fused_decode_gate", False):
+            return
+        norms = (*self.norm_key, *self.norm_query)
+        if not all(
+            type(norm) is nn.RMSNorm
+            and norm.weight.shape == (self.hidden_size,)
+            and norm.weight.dtype == torch.bfloat16
+            and norm.weight.device == self._decode_kv_weight.device
+            and norm.weight.is_contiguous()
+            for norm in norms
+        ):
+            return
+        key_eps = [norm.eps if norm.eps is not None else torch.finfo(torch.float32).eps for norm in self.norm_key]
+        query_eps = [norm.eps if norm.eps is not None else torch.finfo(torch.float32).eps for norm in self.norm_query]
+        if len(set(key_eps)) != 1 or len(set(query_eps)) != 1:
+            return
+        self._decode_gate_key_gamma = torch.stack([norm.weight for norm in self.norm_key])
+        self._decode_gate_query_gamma = torch.stack([norm.weight for norm in self.norm_query])
+        self._decode_gate_eps = (key_eps[0], query_eps[0])
+
+    def _project_decode_gates(self, projections, hidden):
+        if (
+            not getattr(self, "use_fused_decode_gate", False)
+            or projections is None
+            or self._decode_gate_eps is None
+            or self._decode_gate_key_gamma is None
+            or self._decode_gate_query_gamma is None
+            or hidden.device.type != "npu"
+            or self._decode_gate_key_gamma.device != hidden.device
+            or self._decode_gate_query_gamma.device != hidden.device
+            or hidden.ndim != 3
+            or hidden.shape[1:] != (self.hc_mult, self.hidden_size)
+            or hidden.dtype != torch.bfloat16
+            or not hidden.is_contiguous()
+            or len(projections) != self.hc_mult + 1
+            or projections[0].dtype != hidden.dtype
+            or projections[0].device != hidden.device
+            or projections[0].shape != (hidden.shape[0], self.hidden_size)
+            or projections[0].stride() != ((self.hc_mult + 1) * self.hidden_size, 1)
+        ):
+            return None
+        from .engram_fusions import fused_norm_dot_gates
+
+        return fused_norm_dot_gates(
+            projections[0], hidden, self._decode_gate_key_gamma, self._decode_gate_query_gamma, *self._decode_gate_eps
+        )
+
+    def _project_decode_kv(self, x):
+        weight, bias = self._decode_kv_weight, self._decode_kv_bias
+        if (
+            not self.use_packed_decode_projection
+            or self.multi_head_embedding.tp_size != 1
+            or weight is None
+            or bias is None
+            or x.ndim != 2
+            or not x.shape[0]
+            or x.shape[1] != self.total_width
+            or x.dtype != weight.dtype
+            or x.device != weight.device
+            or not x.is_contiguous()
+        ):
+            return None
+        projected = nn.functional.linear(x, weight, bias)
+        # Key norm kernels consume row strides, so these views need no copies.
+        # The final value retains its BF16 boundary before the existing FP32 cast.
+        return projected.split(self.hidden_size, dim=-1)
+
     def _project(self, projection, x):
         result = projection(x)
         if self.multi_head_embedding.tp_size > 1:
@@ -566,7 +683,12 @@ class FlashEngram(nn.Module):
         from .attention import get_flash_attention_metadata
         from .decode_fusions import is_decode_batch
 
-        if is_decode_batch(get_flash_attention_metadata()) and hidden.device.type == "npu" and is_950() and HAS_TRITON:
+        if (
+            is_decode_batch(get_flash_attention_metadata(self.metadata_layer_name))
+            and hidden.device.type == "npu"
+            and is_950()
+            and HAS_TRITON
+        ):
             return self._forward_decode(hidden, hashes, embedding_rows)
         return self._forward_prefill(hidden, hashes, embedding_rows)
 
@@ -606,7 +728,11 @@ class FlashEngram(nn.Module):
             and gamma.shape == x.shape[1:]
             and not self.use_cann_inverse_rms
         )
-        inverse = None if fuse_inverse else _engram_inverse_rms(x, gamma[0], eps, self.use_cann_inverse_rms)
+        inverse = (
+            None
+            if fuse_inverse
+            else _engram_inverse_rms(x, gamma[0], eps, self.use_cann_inverse_rms, layer_name=self.metadata_layer_name)
+        )
         if use_lookup_kernel and (inverse is None or (inverse.dtype == torch.float32 and inverse.is_contiguous())):
             from .prefill_ops.engram_norm import apply_lookup_norm
 
@@ -749,7 +875,7 @@ class FlashEngram(nn.Module):
             signal = self._pre_gamma * value * (value.square().mean(-1, keepdim=True) + eps).rsqrt()
             return engram_residual(hidden, hashes, gate, self._residual_scales, signal)
         gamma = self.unified_pre_gamma.float()
-        inverse = _engram_inverse_rms(value, gamma, eps, self.use_cann_inverse_rms)
+        inverse = _engram_inverse_rms(value, gamma, eps, self.use_cann_inverse_rms, layer_name=self.metadata_layer_name)
         signal = gamma * value * inverse
         scales = torch.stack(list(self.unified_per_hc_scales)).float()
         result = ((gate.float().unsqueeze(-1) + scales) * signal.unsqueeze(1)).to(hidden.dtype)
@@ -759,7 +885,7 @@ class FlashEngram(nn.Module):
         from .attention import get_flash_attention_metadata
         from .decode_fusions import is_decode_batch
 
-        native_norm = is_decode_batch(get_flash_attention_metadata())
+        native_norm = is_decode_batch(get_flash_attention_metadata(self.metadata_layer_name))
         rows = self.multi_head_embedding(hashes) if embedding_rows is None else embedding_rows
         eps = torch.finfo(torch.float32).eps
         if native_norm:
@@ -783,33 +909,38 @@ class FlashEngram(nn.Module):
             x = fused_lookup_norm(rows, local_hashes, gamma, eps, hidden.dtype).flatten(1)
         else:
             x = rows.masked_fill(local_hashes.unsqueeze(-1) < 0, 0)
-            inverse = _engram_inverse_rms(x, gamma[0], eps, self.use_cann_inverse_rms)
+            inverse = _engram_inverse_rms(
+                x, gamma[0], eps, self.use_cann_inverse_rms, layer_name=self.metadata_layer_name
+            )
             x = (x * inverse * gamma).to(hidden.dtype).flatten(1)
-        gates = []
-        for channel in range(self.hc_mult):
-            key = self.key_projs[channel](x)
-            if local.tp_size > 1:
-                key = tensor_model_parallel_all_reduce(key)
-            if native_norm:
-                gate = fused_norm_dot_gate(
-                    key,
-                    hidden[:, channel],
-                    self.norm_key[channel],
-                    self.norm_query[channel],
+        packed_projections = self._project_decode_kv(x) if native_norm else None
+        gate = self._project_decode_gates(packed_projections, hidden) if native_norm else None
+        if gate is None:
+            gates = []
+            for channel in range(self.hc_mult):
+                key = (
+                    packed_projections[channel]
+                    if packed_projections is not None
+                    else self._project(self.key_projs[channel], x)
                 )
-            else:
-                norm_key = self.norm_key[channel](key)
-                norm_query = self.norm_query[channel](hidden[:, channel])
-                gate = (norm_key * norm_query).sum(-1) * self.hidden_size**-0.5
-                gate = (gate.abs().clamp_min(1e-6).sqrt() * gate.sign()).sigmoid()
-            gates.append(gate)
-        gate = torch.stack(gates, dim=1)
-        value = self.value_proj(x)
-        if local.tp_size > 1:
-            value = tensor_model_parallel_all_reduce(value)
+                if native_norm:
+                    gate = fused_norm_dot_gate(
+                        key,
+                        hidden[:, channel],
+                        self.norm_key[channel],
+                        self.norm_query[channel],
+                    )
+                else:
+                    norm_key = self.norm_key[channel](key)
+                    norm_query = self.norm_query[channel](hidden[:, channel])
+                    gate = (norm_key * norm_query).sum(-1) * self.hidden_size**-0.5
+                    gate = (gate.abs().clamp_min(1e-6).sqrt() * gate.sign()).sigmoid()
+                gates.append(gate)
+            gate = torch.stack(gates, dim=1)
+        value = packed_projections[-1] if packed_projections is not None else self._project(self.value_proj, x)
         value = value.float()
         gamma = unified_gamma if native_norm else self.unified_pre_gamma.float()
-        inverse = _engram_inverse_rms(value, gamma, eps, self.use_cann_inverse_rms)
+        inverse = _engram_inverse_rms(value, gamma, eps, self.use_cann_inverse_rms, layer_name=self.metadata_layer_name)
         scales = packed_scales if packed_scales is not None else torch.stack(list(self.unified_per_hc_scales)).float()
         if native_norm:
             from .engram_fusions import fused_residual

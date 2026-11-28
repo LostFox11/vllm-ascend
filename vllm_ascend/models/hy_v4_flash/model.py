@@ -179,10 +179,33 @@ class AscendHYV4FlashModel(HYV4FlashModel):
             for group in (get_tp_group(), get_ep_group()):
                 group.device_communicator.max_sequence_collective_peer_bytes = FLASHCOMM_950_PEER_BYTES
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._bind_layer_metadata()
         self.uses_dfly = vllm_config.speculative_config is not None
         self._engram_prefetch_stream = None
         if self.engram_hash is not None:
             self.engram_hash.use_fused_prefill = is_950() and uses_prefill_ops(vllm_config)
+
+    def _bind_layer_metadata(self):
+        last_layer_name = None
+        for layer in self.layers:
+            attention = getattr(layer, "self_attn", None)
+            if attention is None:
+                continue
+            layer_name = attention.layer_name
+            last_layer_name = layer_name
+            for hc in (layer.hc_attn_layer, layer.hc_mlp_layer):
+                hc.metadata_layer_name = layer_name
+                if hc.enable_ihc:
+                    hc.hc_pre.metadata_layer_name = layer_name
+            if isinstance(layer.mlp, AscendFlashMoE):
+                layer.mlp.metadata_layer_name = layer_name
+                layer.mlp.gate.metadata_layer_name = layer_name
+            engram = getattr(layer, "engram_layer", None)
+            if engram is not None:
+                engram.metadata_layer_name = layer_name
+        head = getattr(self, "hc_head", None)
+        if isinstance(head, FlashHCHeadLayer):
+            head.metadata_layer_name = last_layer_name
 
     def forward(
         self,
@@ -220,7 +243,12 @@ class AscendHYV4FlashModel(HYV4FlashModel):
                     )
         if not defer_hc_head or self.engram_hash is None:
             return super().forward(
-                input_ids, positions, intermediate_tensors, inputs_embeds, lookback_token_ids, prepared_engram,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                lookback_token_ids,
+                prepared_engram,
             )
         hidden = self._forward_prefill_hidden(input_ids, positions, inputs_embeds, lookback_token_ids, prepared_engram)
         if check_hc_head_rows is not None:
@@ -230,7 +258,10 @@ class AscendHYV4FlashModel(HYV4FlashModel):
             max_abs = (reference.float() - selected.float()).abs().max().item()
             logger.info(
                 "HY4 HC_HEAD_CHECK tokens=%d rows=%d different=%d max_abs=%g",
-                hidden.shape[0], selected.shape[0], different, max_abs,
+                hidden.shape[0],
+                selected.shape[0],
+                different,
+                max_abs,
             )
         return hidden
 
@@ -240,11 +271,7 @@ class AscendHYV4FlashModel(HYV4FlashModel):
     def _forward_prefill_hidden(self, input_ids, positions, inputs_embeds, lookback_token_ids, prepared_engram):
         if input_ids is None:
             raise ValueError("Flash Engram requires original input token IDs")
-        hidden = (
-            inputs_embeds
-            if inputs_embeds is not None
-            else self.embed_input_ids(input_ids)
-        )
+        hidden = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
         if prepared_engram is None:
             hashes = input_ids.new_empty(
                 (
@@ -263,10 +290,7 @@ class AscendHYV4FlashModel(HYV4FlashModel):
             rows = None
         else:
             hashes, rows = prepared_engram
-        hash_indices = {
-            layer_id - 1: index
-            for index, layer_id in enumerate(self.config.engram_layer_ids)
-        }
+        hash_indices = {layer_id - 1: index for index, layer_id in enumerate(self.config.engram_layer_ids)}
         for index, layer in enumerate(self.layers):
             if index in hash_indices:
                 hidden = layer.hc_attn_layer.prepare_input(hidden)
@@ -274,9 +298,7 @@ class AscendHYV4FlashModel(HYV4FlashModel):
                 if rows is None:
                     hidden = layer.engram_layer(hidden, hashes[i])
                 else:
-                    hidden = layer.engram_layer(
-                        hidden, hashes[i], embedding_rows=rows[i]
-                    )
+                    hidden = layer.engram_layer(hidden, hashes[i], embedding_rows=rows[i])
             hidden, _ = layer(positions, hidden, None)
         return hidden
 
@@ -322,30 +344,42 @@ class AscendHYV4FlashForCausalLM(HYV4FlashForCausalLM):
             and transfer is not None
             and (
                 transfer.kv_role == "kv_consumer"
-                or (
-                    transfer.kv_role == "kv_producer"
-                    and os.getenv("HY4_PREFILL_FP32_HEAD") == "1"
-                )
+                or (transfer.kv_role == "kv_producer" and os.getenv("HY4_PREFILL_FP32_HEAD") == "1")
             )
         )
 
     def forward(
-        self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None,
-        lookback_token_ids=None, prepared_engram=None, *,
-        defer_hc_head=False, check_hc_head_rows=None, first_ihc_vocab=False,
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        lookback_token_ids=None,
+        prepared_engram=None,
+        *,
+        defer_hc_head=False,
+        check_hc_head_rows=None,
+        first_ihc_vocab=False,
     ):
         return self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds, lookback_token_ids, prepared_engram,
-            defer_hc_head=defer_hc_head, check_hc_head_rows=check_hc_head_rows,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            lookback_token_ids,
+            prepared_engram,
+            defer_hc_head=defer_hc_head,
+            check_hc_head_rows=check_hc_head_rows,
             first_ihc_vocab=first_ihc_vocab,
         )
 
     def load_weights(self, weights):
         loaded = super().load_weights(weights)
-        if self._pack_prefill_engram_weights:
-            for module in self.model.modules():
-                if isinstance(module, FlashEngram):
+        for module in self.model.modules():
+            if isinstance(module, FlashEngram):
+                if self._pack_prefill_engram_weights:
                     module.pack_prefill_weights()
+                module.pack_decode_weights()
         return loaded
 
     @staticmethod

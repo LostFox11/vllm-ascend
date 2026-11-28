@@ -187,3 +187,67 @@ def fused_norm_dot_gate(key, query, key_norm, query_norm):
         enable_fp_fusion=False,
     )
     return output
+
+
+@triton.jit
+def _norm_dot_gate_many_kernel(
+    key,
+    query,
+    gamma_key,
+    gamma_query,
+    output,
+    key_row_stride: tl.constexpr,
+    key_col_stride: tl.constexpr,
+    channels: tl.constexpr,
+    width: tl.constexpr,
+    eps_key: tl.constexpr,
+    eps_query: tl.constexpr,
+    scale: tl.constexpr,
+    block: tl.constexpr,
+):
+    row = tl.program_id(0)
+    channel = tl.program_id(1)
+    col = tl.arange(0, block)
+    live = col < width
+    k = tl.load(key + row * key_row_stride + channel * width + col * key_col_stride, live, 0).to(tl.float32)
+    q = tl.load(query + (row * channels + channel) * width + col, live, 0).to(tl.float32)
+    wk = tl.load(gamma_key + channel * width + col, live, 0).to(tl.float32)
+    wq = tl.load(gamma_query + channel * width + col, live, 0).to(tl.float32)
+    ik = tl.rsqrt(tl.sum(k * k, 0) / width + eps_key)
+    iq = tl.rsqrt(tl.sum(q * q, 0) / width + eps_query)
+    nk = ((k * ik) * wk).to(key.dtype.element_ty).to(tl.float32)
+    nq = ((q * iq) * wq).to(query.dtype.element_ty).to(tl.float32)
+    product = (nk * nq).to(output.dtype.element_ty).to(tl.float32)
+    dot = tl.sum(product, 0).to(output.dtype.element_ty).to(tl.float32)
+    scaled = (dot * scale).to(output.dtype.element_ty).to(tl.float32)
+    floor = tl.full((), 1.0e-6, tl.float32).to(output.dtype.element_ty).to(tl.float32)
+    magnitude = tl.maximum(tl.abs(scaled), floor, propagate_nan=tl.PropagateNan.ALL)
+    magnitude = magnitude.to(output.dtype.element_ty).to(tl.float32)
+    root = tl.sqrt(magnitude).to(output.dtype.element_ty).to(tl.float32)
+    sign = tl.where(scaled > 0, 1.0, tl.where(scaled < 0, -1.0, 0.0))
+    logit = (root * sign).to(output.dtype.element_ty).to(tl.float32)
+    tl.store(output + row * channels + channel, tl.sigmoid(logit))
+
+
+def fused_norm_dot_gates(first_key, query, gamma_key, gamma_query, eps_key, eps_query):
+    """Run the unchanged per-channel reduction in independent grid programs."""
+    rows, channels, width = query.shape
+    output = torch.empty((rows, channels), device=query.device, dtype=torch.promote_types(first_key.dtype, query.dtype))
+    if rows:
+        _norm_dot_gate_many_kernel[(rows, channels)](
+            first_key,
+            query,
+            gamma_key,
+            gamma_query,
+            output,
+            first_key.stride(0),
+            first_key.stride(1),
+            channels,
+            width,
+            eps_key,
+            eps_query,
+            width**-0.5,
+            triton.next_power_of_2(width),
+            enable_fp_fusion=False,
+        )
+    return output
