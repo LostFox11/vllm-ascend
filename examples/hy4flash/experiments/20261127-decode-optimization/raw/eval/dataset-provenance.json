@@ -1,8 +1,0 @@
-{
-  "dataset": "evalscope/aime26",
-  "revision": "12ae93b463353acd4d272dbbc7dbecbcfb902642",
-  "original_sha256": "52822957957a3f577d1e9706c36a66a8108a3f99b6aff424cfb72dff0094a9ee",
-  "local_sha256": "8d9d89ae827fcbadaeee725d567c3012a5429a4ca48533c9162870cb76a74366",
-  "count": 30,
-  "normalization": "answer integer to string for official EvalScope Sample target; problem and numeric answers unchanged"
-}
